@@ -41,6 +41,18 @@ python lotto_lab.py --seed 42    # 재현 가능한 생성
 > (B) CSV를 GitHub 등 공개 URL에 올리고 `.gs` 상단 `MIRROR_LOTTO_CSV`/`MIRROR_PENSION_CSV`에
 > 주소를 설정 — 그러면 시트 메뉴·주간 트리거가 미러에서 자동 수집한다.
 
+### GitHub 미러 셋업 진행 상태 (2026-07-15)
+
+- [x] 로컬 git 저장소 초기화 + 전체 커밋 (`main` 브랜치)
+- [x] `run_update.cmd`에 자동 커밋+푸시 단계 추가 (origin 원격이 있을 때만 동작)
+- [x] GitHub CLI 설치 (`C:\Program Files\GitHub CLI\gh.exe`, 새 터미널에서는 `gh`로 사용 가능)
+- [ ] **GitHub 인증 (사용자 직접)**: 터미널에서 `gh auth login` → GitHub.com / HTTPS / 브라우저 로그인
+- [ ] 저장소 생성+푸시: `gh repo create lotto-lab --public --source . --remote origin --push`
+  (lotto-lab 폴더에서 실행)
+- [ ] `.gs`의 `MIRROR_LOTTO_CSV`/`MIRROR_PENSION_CSV`에
+  `https://raw.githubusercontent.com/<계정명>/lotto-lab/main/data/lotto_history.csv`(및 pension) 입력
+  후 구글 시트의 Apps Script 코드 교체
+
 1. 새 구글 시트 → 확장 프로그램 > Apps Script → `lotto_sheets.gs` 내용 붙여넣기 → 저장
 2. (미러 사용 시) 상단 `MIRROR_*` 상수에 CSV 주소 입력
 3. 시트 새로고침 → 메뉴 [복권분석] > **전체 업데이트+추천**
