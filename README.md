@@ -48,9 +48,10 @@ python lotto_lab.py --seed 42    # 재현 가능한 생성
 - [x] GitHub CLI 설치 (`C:\Program Files\GitHub CLI\gh.exe`, 새 터미널에서는 `gh`로 사용 가능)
 - [x] GitHub 인증 완료 (계정 `LucianaStyle`)
 - [x] `.gs`의 `MIRROR_*` 상수에 raw.githubusercontent.com 미러 URL 입력 완료
-- [ ] 저장소 생성+푸시 (lotto-lab 폴더에서 1회):
-  `gh repo create lotto-lab --public --source . --remote origin --push`
-- [ ] 구글 시트의 Apps Script 코드를 갱신된 `lotto_sheets.gs` 내용으로 교체
+- [x] 저장소 생성+푸시 완료: `github.com/LucianaStyle/lotto-lab` (미러 URL HTTP 200 확인)
+- [ ] 구글 시트의 Apps Script 코드 교체 — 반드시 **시트 안에서** 확장 프로그램 > Apps Script로
+  연 "바인딩된" 프로젝트에 붙여넣을 것 (독립형 프로젝트는 getUi 오류 발생).
+  붙여넣은 뒤 시트 새로고침 → [복권분석] 메뉴 사용
 
 1. 새 구글 시트 → 확장 프로그램 > Apps Script → `lotto_sheets.gs` 내용 붙여넣기 → 저장
 2. (미러 사용 시) 상단 `MIRROR_*` 상수에 CSV 주소 입력

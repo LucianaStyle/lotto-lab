@@ -266,13 +266,57 @@ function buildPicks() {
     sh.appendRow([now, latest + 1, String.fromCharCode(65 + idx)].concat(p.c, [p.f.sum, p.f.odd, Math.round(p.pop * 100) / 100]));
   });
 
-  // 연금복권 추천 (균등 무작위 — 자리별 확률 동일함을 정직하게 표기)
+  // 연금복권 추천 — 품절 대비 순위 리스트 6건
+  // (조·번호 조합은 1장씩만 판매되므로 앞 순위 품절 시 다음 순위로 구매.
+  //  1~5순위는 서로 다른 조로 분산. 실제 당첨 확률은 모든 조합이 동일 — 가중치는 재미 요소)
   var pSh = SpreadsheetApp.getActive().getSheetByName('연금이력');
   if (pSh && pSh.getLastRow() > 1) {
     var pLatest = pSh.getRange(pSh.getLastRow(), 1).getValue();
-    var num = '';
-    for (var d = 0; d < 6; d++) num += Math.floor(Math.random() * 10);
-    sh.appendRow([now, '연금 ' + (pLatest + 1) + '회', (1 + Math.floor(Math.random() * 5)) + '조', "'" + num]);
+    var pData = pSh.getRange(2, 3, pSh.getLastRow() - 1, 2).getValues(); // 조, 번호
+    // 자리별·조별 미달빈도 가중치 계산
+    var posCnt = [], joCnt = [0, 0, 0, 0, 0];
+    for (var d = 0; d < 6; d++) { posCnt.push([0,0,0,0,0,0,0,0,0,0]); }
+    pData.forEach(function (r) {
+      joCnt[Number(r[0]) - 1]++;
+      var s = String(r[1]).replace(/\D/g, ''); while (s.length < 6) s = '0' + s;
+      for (var d2 = 0; d2 < 6; d2++) posCnt[d2][Number(s[d2])]++;
+    });
+    var posW = posCnt.map(function (cnt) {
+      var mean = cnt.reduce(function (a, b) { return a + b; }, 0) / 10;
+      return cnt.map(function (c) { return Math.max(1, 2 * mean - c); });
+    });
+    var joMean = joCnt.reduce(function (a, b) { return a + b; }, 0) / 5;
+    var joW = joCnt.map(function (c) { return Math.max(1, 2 * joMean - c); });
+    var wPick = function (w) {
+      var tot = w.reduce(function (a, b) { return a + b; }, 0), r = Math.random() * tot;
+      for (var i2 = 0; i2 < w.length; i2++) { r -= w[i2]; if (r <= 0) return i2; }
+      return w.length - 1;
+    };
+    // 후보 풀 생성 → 점수순 정렬 → 조 미중복 우선으로 6건 선별
+    var pPool = {}, pList = [];
+    for (var g = 0; g < 400; g++) {
+      var digits = [], score = 0;
+      for (var d3 = 0; d3 < 6; d3++) { var dg = wPick(posW[d3]); digits.push(dg); score += posW[d3][dg]; }
+      var jo = wPick(joW) + 1;
+      var key = jo + '-' + digits.join('');
+      if (pPool[key]) continue;
+      pPool[key] = 1;
+      pList.push({ jo: jo, num: digits.join(''), score: score + joW[jo - 1] });
+    }
+    pList.sort(function (x, y) { return y.score - x.score; });
+    var pPicked = [];
+    pList.forEach(function (cand) {
+      if (pPicked.length >= 6) return;
+      var joUsed = pPicked.some(function (q) { return q.jo === cand.jo; });
+      if (pPicked.length < 5 && joUsed) return;
+      pPicked.push(cand);
+    });
+    pList.forEach(function (cand) {
+      if (pPicked.length < 6 && pPicked.indexOf(cand) < 0) pPicked.push(cand);
+    });
+    pPicked.forEach(function (cand, r2) {
+      sh.appendRow([now, '연금 ' + (pLatest + 1) + '회', (r2 + 1) + '순위', cand.jo + '조', "'" + cand.num]);
+    });
   }
-  SpreadsheetApp.getActive().toast('추천 5세트 + 연금 1건 생성 완료');
+  SpreadsheetApp.getActive().toast('추천 5세트 + 연금 순위 6건 생성 완료');
 }

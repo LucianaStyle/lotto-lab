@@ -306,17 +306,46 @@ def analyze_pension(df: pd.DataFrame) -> dict:
             "pos_freq": pos_freq, "jo_freq": jo_freq, "pos_pvals": pvals, "jo_p": jo_p}
 
 
-def generate_pension(a: dict, seed: int | None = None) -> dict:
+def generate_pension(a: dict, n: int = 6, seed: int | None = None) -> list[dict]:
+    """순위가 매겨진 후보 n개 생성. 연금복권은 조·번호 조합이 1장씩만 판매되므로
+    품절 대비 예비 후보가 필요하다. 1~5순위는 서로 다른 조로 분산(특정 조 매진 대비).
+    순위 기준은 자리별 미달빈도 가중 점수 — 재미 요소이며 실제 확률은 모두 동일하다.
+    """
     rng = random.Random(seed)
-    # 자리별 최근 균형: 관측빈도가 기대치보다 낮은 숫자에 소폭 가중(재미 요소,
-    # 통계적 우위는 없음 — 자리별 p값이 이를 증명)
-    pick = []
+    weights = []
     for i in range(6):
         obs = np.array([a["pos_freq"][i].get(d, 0) for d in range(10)])
-        w = (obs.mean() * 2 - obs).clip(min=1).astype(float)
-        pick.append(rng.choices(range(10), weights=w)[0])
-    jo = rng.randint(1, 5)
-    return {"jo": jo, "num": "".join(map(str, pick))}
+        weights.append((obs.mean() * 2 - obs).clip(min=1).astype(float))
+    jo_obs = np.array([a["jo_freq"].get(j, 0) for j in range(1, 6)])
+    jo_w = (jo_obs.mean() * 2 - jo_obs).clip(min=1).astype(float)
+
+    pool, seen = [], set()
+    for _ in range(600):
+        num = tuple(rng.choices(range(10), weights=weights[i])[0] for i in range(6))
+        jo = rng.choices(range(1, 6), weights=jo_w)[0]
+        if (jo, num) in seen:
+            continue
+        seen.add((jo, num))
+        score = sum(weights[i][num[i]] for i in range(6)) + jo_w[jo - 1]
+        pool.append({"jo": jo, "num": num, "score": float(score)})
+    pool.sort(key=lambda p: -p["score"])
+
+    picked: list[dict] = []
+    for p in pool:  # 1차: 조 미중복 + 자리 일치 ≤3 (후보 간 다양성)
+        if len(picked) >= n:
+            break
+        if len(picked) < 5 and p["jo"] in [q["jo"] for q in picked]:
+            continue
+        if any(sum(1 for i in range(6) if p["num"][i] == q["num"][i]) > 3 for q in picked):
+            continue
+        picked.append(p)
+    for p in pool:  # 2차: 모자라면 제약 완화해 채움
+        if len(picked) >= n:
+            break
+        if p not in picked:
+            picked.append(p)
+    return [{"rank": i + 1, "jo": p["jo"], "num": "".join(map(str, p["num"]))}
+            for i, p in enumerate(picked)]
 
 
 # ──────────────────────────────── 리포트 ────────────────────────────────
@@ -372,10 +401,13 @@ def run_report(n_sets: int, seed: int | None):
         w(f"- {chr(64+i)}세트: **{fmt_nums(s['nums'])}**  (합 {s['sum']}, 홀 {s['odd']}, 인기도 {s['pop']:+.2f})")
     w("")
 
-    pn = generate_pension(p, seed=seed)
-    w(f"## 6. 연금복권 720+ 추천 ({p['latest'] + 1}회차용)")
-    w(f"- **{pn['jo']}조 {pn['num']}**")
-    w(f"  (자리별 균등성 p값이 모두 큼 → 어떤 숫자든 확률 동일. 미달빈도 소폭 가중은 재미 요소임을 명시)\n")
+    pns = generate_pension(p, n=max(6, n_sets), seed=seed)
+    w(f"## 6. 연금복권 720+ 추천 ({p['latest'] + 1}회차용, 품절 대비 순위 리스트)")
+    w("연금복권은 조·번호 조합이 1장씩만 판매되므로, 앞 순위가 품절이면 다음 순위로 구매.")
+    w("1~5순위는 서로 다른 조로 분산(특정 조 매진 대비). 실제 당첨 확률은 모든 조합이 동일.")
+    for pn in pns:
+        w(f"- {pn['rank']}순위: **{pn['jo']}조 {pn['num']}**")
+    w("")
 
     w("> ⚠️ 본 리포트의 어떤 항목도 당첨 확률 자체를 높이지 않는다. 5번 항목의 분할 회피만이")
     w("> '당첨됐을 때 더 많이 받는' 방향의 실질적 최적화다. 구매는 여유 자금 내에서.")
