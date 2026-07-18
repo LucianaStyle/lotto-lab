@@ -20,8 +20,8 @@
  *       아래 MIRROR_* 상수에 그 주소를 넣으면 시트가 미러에서 자동 수집한다.
  */
 
-var MIRROR_LOTTO_CSV = '';    // 예: 'https://raw.githubusercontent.com/<계정>/<repo>/main/data/lotto_history.csv'
-var MIRROR_PENSION_CSV = '';  // 예: '.../data/pension_history.csv'
+var MIRROR_LOTTO_CSV = 'https://raw.githubusercontent.com/LucianaStyle/lotto-lab/main/data/lotto_history.csv';
+var MIRROR_PENSION_CSV = 'https://raw.githubusercontent.com/LucianaStyle/lotto-lab/main/data/pension_history.csv';
 
 var BASE = 'https://www.dhlottery.co.kr';
 var FETCH_OPT = {
