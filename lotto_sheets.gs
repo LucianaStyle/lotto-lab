@@ -46,6 +46,7 @@ var PICK_HIT = 14, PICK_RANK = 15;
 
 var PPICK_HEAD = ['생성일', '대상회차', '추첨일', '순위', '조', '번호', '적중자리', '등수'];
 var PPICK_NUM = 6, PPICK_HIT = 7, PPICK_RANK = 8;
+var PENSION_N = 20;   // 연금 후보 수 — 조·번호 조합이 1장뿐이라 품절 대비로 넉넉히 뽑는다
 
 // ───────────────────────── 메뉴 ─────────────────────────
 
@@ -348,9 +349,10 @@ function buildPicks_(force) {
   toast_('추천 생성 완료 (로또 ' + target + '회)');
 }
 
-// 연금복권 추천 — 품절 대비 순위 리스트 6건
-// (조·번호 조합은 1장씩만 판매되므로 앞 순위 품절 시 다음 순위로 구매.
-//  1~5순위는 서로 다른 조로 분산. 실제 당첨 확률은 모든 조합이 동일 — 가중치는 재미 요소)
+// 연금복권 추천 — 품절 대비 순위 리스트 PENSION_N건
+// 조·번호 조합은 전국에 1장뿐이라 이미 팔린 것은 살 수 없다. 앞 순위 품절 시 다음 순위로 구매.
+// 조는 1~5조에 라운드로빈으로 고르게 배정 — 한 조가 통째로 매진돼도 대안이 남는다.
+// (실제 당첨 확률은 모든 조합이 동일 — 자리별 가중치는 재미 요소)
 function buildPensionPicks_(force) {
   var pSh = SpreadsheetApp.getActive().getSheetByName(SH_PENSION);
   if (!pSh || pSh.getLastRow() < 2) return;
@@ -359,51 +361,62 @@ function buildPensionPicks_(force) {
   var sh = sheet(SH_PPICK, PPICK_HEAD);
   if (!force && hasTarget_(sh, 2, target)) return;
 
-  var pData = pSh.getRange(2, 3, pSh.getLastRow() - 1, 2).getValues();  // 조, 번호
-  var posCnt = [], joCnt = [0, 0, 0, 0, 0];
+  var pData = pSh.getRange(2, 4, pSh.getLastRow() - 1, 1).getValues();  // 번호
+  var posCnt = [];
   for (var d = 0; d < 6; d++) posCnt.push([0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
   pData.forEach(function (r) {
-    var jo = Number(r[0]);
-    if (jo >= 1 && jo <= 5) joCnt[jo - 1]++;
-    var s = pad6_(r[1]);
+    var s = pad6_(r[0]);
     for (var d2 = 0; d2 < 6; d2++) posCnt[d2][Number(s[d2])]++;
   });
   var posW = posCnt.map(function (cnt) {
     var mean = cnt.reduce(function (a, b) { return a + b; }, 0) / 10;
     return cnt.map(function (x) { return Math.max(1, 2 * mean - x); });
   });
-  var joMean = joCnt.reduce(function (a, b) { return a + b; }, 0) / 5;
-  var joW = joCnt.map(function (x) { return Math.max(1, 2 * joMean - x); });
   var wPick = function (w) {
     var tot = w.reduce(function (a, b) { return a + b; }, 0), r = Math.random() * tot;
     for (var i = 0; i < w.length; i++) { r -= w[i]; if (r <= 0) return i; }
     return w.length - 1;
   };
 
+  // 번호(6자리)만 점수순으로 뽑고, 조는 뒤에서 균등 배정한다
   var seen = {}, list = [];
-  for (var g = 0; g < 400; g++) {
+  for (var g = 0; g < Math.max(2000, PENSION_N * 100); g++) {
     var digits = [], score = 0;
     for (var d3 = 0; d3 < 6; d3++) { var dg = wPick(posW[d3]); digits.push(dg); score += posW[d3][dg]; }
-    var jo2 = wPick(joW) + 1;
-    var key = jo2 + '-' + digits.join('');
+    var key = digits.join('');
     if (seen[key]) continue;
     seen[key] = 1;
-    list.push({ jo: jo2, num: digits.join(''), score: score + joW[jo2 - 1] });
+    list.push({ num: key, score: score });
   }
   list.sort(function (x, y) { return y.score - x.score; });
+
   var picked = [];
-  list.forEach(function (cand) {
-    if (picked.length >= 6) return;
-    if (picked.length < 5 && picked.some(function (q) { return q.jo === cand.jo; })) return;
-    picked.push(cand);
+  list.forEach(function (cand) {   // 후보 간 자리 일치 ≤3
+    if (picked.length >= PENSION_N) return;
+    var tooClose = picked.some(function (q) {
+      var same = 0;
+      for (var i = 0; i < 6; i++) if (q.num[i] === cand.num[i]) same++;
+      return same > 3;
+    });
+    if (!tooClose) picked.push(cand);
   });
-  list.forEach(function (cand) {
-    if (picked.length < 6 && picked.indexOf(cand) < 0) picked.push(cand);
+  list.forEach(function (cand) {   // 모자라면 제약 완화해 채움
+    if (picked.length < PENSION_N && picked.indexOf(cand) < 0) picked.push(cand);
   });
+
+  // 조 라운드로빈 배정 (5개 단위로 1~5조 한 번씩, 순서는 매회 섞어 편향 방지)
+  var jos = [];
+  while (jos.length < picked.length) {
+    var bag = [1, 2, 3, 4, 5];
+    for (var b = bag.length - 1; b > 0; b--) {
+      var s = Math.floor(Math.random() * (b + 1)), tp = bag[b]; bag[b] = bag[s]; bag[s] = tp;
+    }
+    jos = jos.concat(bag);
+  }
 
   var now = new Date(), drawDate = nextDraw_(4);  // 목요일
   var out = picked.map(function (p, i) {
-    return [now, target, drawDate, (i + 1) + '순위', p.jo, p.num, '', ''];
+    return [now, target, drawDate, (i + 1) + '순위', jos[i], p.num, '', ''];
   });
   var at = sh.getLastRow() + 1;
   sh.getRange(at, 1, out.length, PPICK_HEAD.length).setValues(out);
