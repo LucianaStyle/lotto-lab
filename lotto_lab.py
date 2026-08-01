@@ -29,7 +29,7 @@ import random
 import sys
 import time
 from collections import Counter
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import numpy as np
 import pandas as pd
@@ -360,6 +360,19 @@ def fmt_nums(nums) -> str:
     return " ".join(f"{n:2d}" for n in nums)
 
 
+WEEKDAY_KR = "월화수목금토일"
+
+
+def draw_date_for(df: pd.DataFrame, target: int) -> str:
+    """대상 회차의 추첨일 = 마지막 추첨일 + 7일 × 회차 차이.
+    로또·연금 모두 창설 이래 예외 없이 주 1회다(전 회차 간격 7일 검증됨).
+    '다음 토요일'식 계산은 추첨 직후 실행 시 당일을 반환해 7일 어긋난다."""
+    last = df.iloc[-1]
+    d = datetime.strptime(str(int(last["date"])), "%Y%m%d").date()
+    d += timedelta(days=7 * (int(target) - int(last["epsd"])))
+    return f"{d:%Y-%m-%d}({WEEKDAY_KR[d.weekday()]})"
+
+
 def run_report(n_sets: int, seed: int | None, n_pension: int = PENSION_N):
     lotto = pd.read_csv(LOTTO_CSV)
     pension = pd.read_csv(PENSION_CSV, dtype={"num": str, "bonus": str})
@@ -401,14 +414,17 @@ def run_report(n_sets: int, seed: int | None, n_pension: int = PENSION_N):
     w(f"  → 양(+)의 계수 특성이 많은 조합일수록 당첨자가 많았음(상금 분할↑). 생성기는 이 점수를 최소화.\n")
 
     sets = generate_sets(a, n_sets=n_sets, seed=seed)
-    w(f"## 5. 이번 주 추천 조합 (로또 {a['latest'] + 1}회차용, {n_sets}세트)")
+    lotto_target = a["latest"] + 1
+    w(f"## 5. 이번 주 추천 조합 (로또 {lotto_target}회차 — {draw_date_for(lotto, lotto_target)} 추첨, {n_sets}세트)")
     w("프로파일 필터 통과 + 예측 인기도(분할 위험) 최소화 + 세트 간 중복 ≤2")
     for i, s in enumerate(sets, 1):
         w(f"- {chr(64+i)}세트: **{fmt_nums(s['nums'])}**  (합 {s['sum']}, 홀 {s['odd']}, 인기도 {s['pop']:+.2f})")
     w("")
 
     pns = generate_pension(p, n=n_pension, seed=seed)
-    w(f"## 6. 연금복권 720+ 추천 ({p['latest'] + 1}회차용, 품절 대비 {len(pns)}순위)")
+    pen_target = p["latest"] + 1
+    w(f"## 6. 연금복권 720+ 추천 ({pen_target}회차 — {draw_date_for(pension, pen_target)} 추첨, "
+      f"품절 대비 {len(pns)}순위)")
     w("조·번호 조합은 전국에 1장씩만 존재해 이미 팔린 것은 살 수 없다. 앞 순위가 품절이면 다음 순위로.")
     w("조는 1~5조에 고르게 배정되어 있어, 한 조가 통째로 매진돼도 대안이 남는다.")
     w("")

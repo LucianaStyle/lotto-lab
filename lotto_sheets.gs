@@ -110,12 +110,23 @@ function ymd_(v) {
   return new Date(Number(s.slice(0, 4)), Number(s.slice(4, 6)) - 1, Number(s.slice(6, 8)));
 }
 
-// 다음 추첨일 (로또=토, 연금=목). 당일이면 그 주로 간주
+// 대상 회차의 추첨일 = 마지막 추첨일 + 7일 × 회차 차이.
+// 로또·연금 모두 창설 이래 예외 없이 주 1회이므로(전 회차 간격 7일 검증됨) 정확하다.
+// "다음 토요일"식 계산은 추첨 직후(토 21:30 스케줄러) 실행 시 당일을 반환해 7일 어긋난다.
+function drawDateFor_(lastDate, lastEpsd, targetEpsd) {
+  var base = ymd_(lastDate);
+  if (!base) return nextDraw_(targetEpsd % 2 === 0 ? 6 : 6);  // 이력이 없을 때만 대체
+  var d = new Date(base.getTime());
+  d.setDate(d.getDate() + 7 * (Number(targetEpsd) - Number(lastEpsd)));
+  return d;
+}
+
+// 이력이 아예 없을 때만 쓰는 대체 계산 (dow: 0=일 … 6=토)
 function nextDraw_(dow) {
   var d = new Date();
   d.setHours(0, 0, 0, 0);
-  d.setDate(d.getDate() + ((dow - d.getDay() + 7) % 7));
-  return d;
+  var delta = (dow - d.getDay() + 7) % 7;
+  return new Date(d.getTime() + (delta === 0 ? 7 : delta) * 864e5);
 }
 
 function getJson(url) {
@@ -335,7 +346,8 @@ function buildPicks_(force) {
       if (ok) picked.push(top[t]);
     }
 
-    var now = new Date(), drawDate = nextDraw_(6);  // 토요일
+    var lastRow = data[data.length - 1];
+    var now = new Date(), drawDate = drawDateFor_(lastRow[1], lastRow[0], target);
     var out = picked.map(function (p, idx) {
       return [now, target, drawDate, String.fromCharCode(65 + idx)]
         .concat(p.c, [p.f.sum, p.f.odd, Math.round(p.pop * 100) / 100, '', '']);
@@ -414,7 +426,8 @@ function buildPensionPicks_(force) {
     jos = jos.concat(bag);
   }
 
-  var now = new Date(), drawDate = nextDraw_(4);  // 목요일
+  var lastDate = pSh.getRange(pSh.getLastRow(), 2).getValue();
+  var now = new Date(), drawDate = drawDateFor_(lastDate, pLatest, target);
   var out = picked.map(function (p, i) {
     return [now, target, drawDate, (i + 1) + '순위', jos[i], p.num, '', ''];
   });
