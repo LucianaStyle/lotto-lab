@@ -1,35 +1,35 @@
 # -*- coding: utf-8 -*-
 """
-lotto_lab.py — 로또 6/45 + 연금복권 720+ 데이터 수집·통계 분석·번호 생성 도구
+lotto_lab.py — 로또 6/45 + 연금복권 720+ 데이터 수집·분석·번호 생성 (엔진 v2)
 
 사용법:
-    python lotto_lab.py            # 데이터 갱신 + 전체 분석 + 추천 번호 출력
-    python lotto_lab.py --update   # 데이터 갱신만
-    python lotto_lab.py --sets 10  # 추천 세트 수 지정
+    python lotto_lab.py              # 데이터 갱신 + 추천(회차당 1회만 생성) + 채점 + 리포트
+    python lotto_lab.py --update     # 데이터 갱신만
+    python lotto_lab.py --no-fetch   # 저장 데이터로 추천·리포트만
+    python lotto_lab.py --strength 1 # 분할 회피 강도 (0=무작위 ~ 2=강함, 기본 0.5)
+    python tools/backtest.py         # 엔진 검증 (워크포워드 백테스트 → data/backtest.csv)
 
 데이터 출처: 동행복권 공개 API (2026-07 개편 신규 엔드포인트)
-  로또:   /lt645/selectPstLt645InfoNew.do?srchDir=center&srchLtEpsd=N  (회차당 ~10건)
-  연금:   /pt720/selectPstPt720WnList.do                               (전체 이력 일괄)
+  로또: /lt645/selectPstLt645InfoNew.do?srchDir=center&srchLtEpsd=N  (회차당 ~10건)
+  연금: /pt720/selectPstPt720WnList.do                               (전체 이력 일괄)
 
-방법론 요약 (정직 고지):
-  * 각 추첨은 독립시행 — 어떤 통계도 '다음 번호'의 적중 확률을 높이지 못한다.
-  * 이 도구가 실제로 최적화하는 것은 두 가지:
-    (1) 프로파일 필터: 과거 당첨 조합의 통계적 형태(합계·홀짝·구간분산)에서
-        극단적으로 벗어나는 조합을 배제 — 확률은 동일하나 "전형적" 조합만 남김.
-    (2) 분할 회피(실질 기대값 개선): 회차별 1등 당첨자 수와 판매량 데이터로
-        '조합 인기도 모형'을 적합, 남들이 많이 찍는 조합을 피해
-        당첨 시 독식 확률을 높인다. 이것이 유일하게 수학적으로 유효한 엣지다.
+엔진 v2 원칙 (2026-09 개편 — v1은 23~31번을 0.28배로 기피하는 편중이 있었다):
+  1. 확률: 모든 조합의 1등 확률은 1/8,145,060으로 같다. 어떤 필터도 이것을 바꾸지 못한다.
+  2. 분할 회피: 5등(회당 ~270만 명) 당첨자 수의 '기대 대비 배율'로 번호별 인기도를 역산한다
+     (표본 외 예측 상관 0.84). 인기 번호를 조금 덜 고르면 1등 당첨 시 나눠 가질 사람이 준다.
+  3. 분산: 5세트 30개 번호를 겹치지 않게, 번호 구간(1-9/10대/20대/30대/40대)별 비율대로 배치한다.
+     구간 편중이 구조적으로 불가능하고, 5세트가 같이 맞고 같이 틀리는 일이 줄어
+     '주당 5등 이상 1건이라도' 확률이 무작위보다 높다(11.8% vs 11.3%, 기대 상금은 동일).
 """
 import argparse
-import itertools
-import json
-import math
 import os
 import random
+import re
 import sys
 import time
 from collections import Counter
 from datetime import date, datetime, timedelta
+from math import comb
 
 import numpy as np
 import pandas as pd
@@ -38,16 +38,31 @@ from scipy import stats
 
 BASE = "https://www.dhlottery.co.kr"
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36"}
-DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+ROOT = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(ROOT, "data")
 LOTTO_CSV = os.path.join(DATA_DIR, "lotto_history.csv")
 PENSION_CSV = os.path.join(DATA_DIR, "pension_history.csv")
-REPORT_MD = os.path.join(os.path.dirname(os.path.abspath(__file__)), "report.md")
+LOTTO_PICKS_CSV = os.path.join(DATA_DIR, "lotto_picks.csv")
+PENSION_PICKS_CSV = os.path.join(DATA_DIR, "pension_picks.csv")
+POPULARITY_CSV = os.path.join(DATA_DIR, "popularity.csv")
+SCOREBOARD_CSV = os.path.join(DATA_DIR, "scoreboard.csv")
+BACKTEST_CSV = os.path.join(DATA_DIR, "backtest.csv")
+REPORT_MD = os.path.join(ROOT, "report.md")
+LOG_FILE = os.path.join(ROOT, "logs", "update.log")
 
-FIRST_DRAW_DATE = date(2002, 12, 7)  # 로또 1회 추첨일
-TOTAL_COMBOS = 8_145_060             # C(45,6)
-TICKET_PRICE = 1000
-
+FIRST_DRAW_DATE = date(2002, 12, 7)   # 로또 1회 추첨일
+TOTAL_COMBOS = comb(45, 6)            # 8,145,060
 NUM_COLS = ["n1", "n2", "n3", "n4", "n5", "n6"]
+LOTTO_COLS = ["epsd", "date", *NUM_COLS, "bonus", "rank1_winners", "rank1_amount", "sales",
+              "r2_n", "r3_n", "r4_n", "r5_n"]
+RANGES = [(1, 9), (10, 19), (20, 29), (30, 39), (40, 45)]
+ENGINE = "v2"
+STRENGTH_DEFAULT = 0.5   # 1.0 이상이면 7·12번이 거의 안 나와 또 다른 편중으로 보인다 (튜닝 결과)
+PENSION_N = 20           # 연금은 조·번호 조합이 1장뿐이라 품절 대비로 넉넉히
+
+# k개 일치 확률 (균등 무작위 구매 가정) — 등수별 '기대 당첨자 수'의 기준
+P_MATCH = {k: comb(6, k) * comb(39, 6 - k) / TOTAL_COMBOS for k in range(7)}
+P_RANK5 = P_MATCH[3]
 
 
 # ──────────────────────────────── 데이터 수집 ────────────────────────────────
@@ -70,20 +85,19 @@ def get_with_retry(sess, url: str, params: dict | None = None, tries: int = 3):
 
 
 def fetch_lotto_window(sess: requests.Session, epsd: int) -> list[dict]:
-    url = f"{BASE}/lt645/selectPstLt645InfoNew.do"
-    r = get_with_retry(sess, url, {"srchDir": "center", "srchLtEpsd": epsd})
-    rows = r.json().get("data", {}).get("list", []) or []
+    r = get_with_retry(sess, f"{BASE}/lt645/selectPstLt645InfoNew.do",
+                       {"srchDir": "center", "srchLtEpsd": epsd})
     out = []
-    for d in rows:
+    for d in r.json().get("data", {}).get("list", []) or []:
         out.append({
-            "epsd": d["ltEpsd"],
-            "date": d["ltRflYmd"],
-            "n1": d["tm1WnNo"], "n2": d["tm2WnNo"], "n3": d["tm3WnNo"],
-            "n4": d["tm4WnNo"], "n5": d["tm5WnNo"], "n6": d["tm6WnNo"],
+            "epsd": d["ltEpsd"], "date": d["ltRflYmd"],
+            **{f"n{i}": d[f"tm{i}WnNo"] for i in range(1, 7)},
             "bonus": d["bnsWnNo"],
             "rank1_winners": d.get("rnk1WnNope"),
             "rank1_amount": d.get("rnk1WnAmt"),
-            "sales": d.get("rlvtEpsdSumNtslAmt"),
+            # 총판매액. rlvtEpsdSumNtslAmt는 당첨금 배분액(약 400회 이후 판매액의 50%)이라 쓰면 안 된다.
+            "sales": d.get("wholEpsdSumNtslAmt"),
+            **{f"r{k}_n": d.get(f"rnk{k}WnNope") for k in range(2, 6)},
         })
     return out
 
@@ -93,10 +107,12 @@ def update_lotto() -> pd.DataFrame:
     have: dict[int, dict] = {}
     if os.path.exists(LOTTO_CSV):
         old = pd.read_csv(LOTTO_CSV)
-        have = {int(r["epsd"]): r.to_dict() for _, r in old.iterrows()}
+        if "r5_n" in old.columns:            # 구 스키마(판매액 오류·등수 누락)는 통째로 재수집
+            have = {int(r["epsd"]): r.to_dict() for _, r in old.iterrows()}
+        else:
+            print("[로또] 데이터 스키마 갱신 — 전 회차 재수집", flush=True)
 
     sess = requests.Session()
-    # 최신 회차 확정: 미래 회차는 빈 리스트가 오므로 추정치부터 아래로 탐색
     probe = []
     for e in range(estimate_latest_epsd() + 1, estimate_latest_epsd() - 6, -1):
         probe = fetch_lotto_window(sess, e)
@@ -112,342 +128,479 @@ def update_lotto() -> pd.DataFrame:
     missing = [e for e in range(1, latest + 1) if e not in have]
     if missing:
         print(f"[로또] 최신 {latest}회 / 수집 필요 {len(missing)}회 다운로드 중...", flush=True)
-        # center 윈도우가 ~10건씩 반환하므로 9회차 간격으로 순회
-        targets = sorted({min(latest, e + 4) for e in missing})
         done = set()
-        for t in targets:
+        for t in sorted({min(latest, e + 4) for e in missing}):   # center 윈도우가 ~10건씩
             if t in done:
                 continue
             for r in fetch_lotto_window(sess, t):
                 have[r["epsd"]] = r
                 done.add(r["epsd"])
             time.sleep(0.15)
-        missing = [e for e in range(1, latest + 1) if e not in have]
-        for e in missing:  # 윈도우 경계에서 빠진 회차 보충
+        for e in [e for e in range(1, latest + 1) if e not in have]:
             for r in fetch_lotto_window(sess, e):
                 have[r["epsd"]] = r
             time.sleep(0.15)
 
-    df = pd.DataFrame(sorted(have.values(), key=lambda r: r["epsd"]))
+    df = pd.DataFrame(sorted(have.values(), key=lambda r: r["epsd"]))[LOTTO_COLS]
     df.to_csv(LOTTO_CSV, index=False)
-    print(f"[로또] {len(df)}회분 저장 완료 → {LOTTO_CSV}")
+    print(f"[로또] {len(df)}회분 저장 완료 (최신 {latest}회)")
     return df
 
 
 def update_pension() -> pd.DataFrame:
     os.makedirs(DATA_DIR, exist_ok=True)
     r = get_with_retry(requests.Session(), f"{BASE}/pt720/selectPstPt720WnList.do")
-    rows = r.json()["data"]["result"]
     df = pd.DataFrame([{
         "epsd": d["psltEpsd"], "date": d["psltRflYmd"],
         "jo": int(d["wnBndNo"]), "num": str(d["wnRnkVl"]).zfill(6),
         "bonus": str(d["bnsRnkVl"]).zfill(6),
-    } for d in rows]).sort_values("epsd").reset_index(drop=True)
+    } for d in r.json()["data"]["result"]]).sort_values("epsd").reset_index(drop=True)
     df.to_csv(PENSION_CSV, index=False)
-    print(f"[연금] {len(df)}회분 저장 완료 → {PENSION_CSV}")
+    print(f"[연금] {len(df)}회분 저장 완료 (최신 {int(df['epsd'].max())}회)")
     return df
 
 
-# ──────────────────────────────── 조합 특성 ────────────────────────────────
-
-def combo_features(nums: tuple[int, ...]) -> dict:
-    s = sorted(nums)
-    consec = sum(1 for a, b in zip(s, s[1:]) if b - a == 1)
-    return {
-        "sum": sum(s),
-        "odd": sum(1 for x in s if x % 2),
-        "low": sum(1 for x in s if x <= 22),          # 1~22 저구간
-        "le31": sum(1 for x in s if x <= 31),         # 생일 범위(인기 구간)
-        "consec": consec,
-        "decades": len({(x - 1) // 10 for x in s}),   # 십의 자리 구간 다양성
-        "range": s[-1] - s[0],
-    }
+def load_pension() -> pd.DataFrame:
+    return pd.read_csv(PENSION_CSV, dtype={"num": str, "bonus": str})
 
 
-# ──────────────────────────────── 통계 분석 ────────────────────────────────
-
-def analyze_lotto(df: pd.DataFrame, recent_n: int = 52) -> dict:
-    all_nums = df[NUM_COLS].to_numpy().ravel()
-    freq = Counter(all_nums)
-    n_draws = len(df)
-
-    # 1) 균등성 검정 (카이제곱): p가 크면 "완전 무작위와 구별 불가"
-    obs = np.array([freq.get(i, 0) for i in range(1, 46)])
-    chi2, pval = stats.chisquare(obs)
-
-    # 2) 최근 구간 hot/cold
-    recent = df.tail(recent_n)
-    rfreq = Counter(recent[NUM_COLS].to_numpy().ravel())
-
-    # 3) 미출현 기간 (overdue)
-    last_seen = {}
-    for _, row in df.iterrows():
-        for c in NUM_COLS:
-            last_seen[row[c]] = row["epsd"]
-    latest = df["epsd"].max()
-    overdue = {i: latest - last_seen.get(i, 0) for i in range(1, 46)}
-
-    # 4) 조합 프로파일 분포 (필터 경계 산출: 중앙 90%)
-    feats = pd.DataFrame([combo_features(tuple(r)) for r in df[NUM_COLS].to_numpy()])
-    sum_lo, sum_hi = np.percentile(feats["sum"], [5, 95])
-
-    # 5) 짝 동반출현 top
-    pair_cnt = Counter()
-    for r in df[NUM_COLS].to_numpy():
-        pair_cnt.update(itertools.combinations(sorted(r), 2))
-
-    # 6) 인기도 모형: 1등 당첨자수(판매량 보정) ~ 조합 특성
-    #    ratio = 관측 당첨자수 / (판매게임수 / 8,145,060) → 1보다 크면 대중적 조합
-    m = df.dropna(subset=["rank1_winners", "sales"]).copy()
-    m = m[(m["sales"] > 0) & (m["epsd"] >= latest - 520)]  # 최근 10년: 현재 구매 행태 반영
-    mf = pd.DataFrame([combo_features(tuple(r)) for r in m[NUM_COLS].to_numpy()])
-    expected = (m["sales"].to_numpy() / TICKET_PRICE) / TOTAL_COMBOS
-    ratio = (m["rank1_winners"].to_numpy() + 0.5) / (expected + 0.5)
-    X = np.column_stack([
-        np.ones(len(mf)),
-        mf["le31"], mf["consec"], mf["odd"],
-        np.abs(mf["sum"] - feats["sum"].mean()) / 10.0,
-        mf["decades"],
-    ])
-    coef, *_ = np.linalg.lstsq(X, np.log(ratio), rcond=None)
-    # 회귀 유의성(대략): 잔차 대비 설명력
-    pred = X @ coef
-    ss_res = np.sum((np.log(ratio) - pred) ** 2)
-    ss_tot = np.sum((np.log(ratio) - np.log(ratio).mean()) ** 2)
-    r2 = 1 - ss_res / ss_tot
-
-    return {
-        "n_draws": n_draws, "latest": int(latest),
-        "freq": freq, "rfreq": rfreq, "recent_n": recent_n,
-        "chi2": chi2, "pval": pval,
-        "overdue": overdue,
-        "feats": feats, "sum_range": (sum_lo, sum_hi),
-        "pairs_top": pair_cnt.most_common(10),
-        "pop_coef": coef, "pop_r2": r2,
-        "sum_mean": feats["sum"].mean(),
-        "history_sets": {tuple(sorted(r)) for r in df[NUM_COLS].to_numpy()},
-        "last_draw": tuple(sorted(df.iloc[-1][NUM_COLS])),
-    }
-
-
-def popularity_score(nums: tuple[int, ...], coef: np.ndarray, sum_mean: float) -> float:
-    """예측 log(당첨자수 배율). 낮을수록 '남들이 안 찍는' 조합."""
-    f = combo_features(nums)
-    x = np.array([1.0, f["le31"], f["consec"], f["odd"],
-                  abs(f["sum"] - sum_mean) / 10.0, f["decades"]])
-    return float(x @ coef)
-
-
-# ──────────────────────────────── 번호 생성 ────────────────────────────────
-
-def generate_sets(a: dict, n_sets: int = 5, pool_size: int = 200_000,
-                  seed: int | None = None) -> list[dict]:
-    rng = random.Random(seed)
-    sum_lo, sum_hi = a["sum_range"]
-    cands = []
-    seen = set()
-    while len(cands) < pool_size:
-        c = tuple(sorted(rng.sample(range(1, 46), 6)))
-        if c in seen:
-            continue
-        seen.add(c)
-        f = combo_features(c)
-        # 프로파일 필터: 역대 1등 조합의 전형적 형태 (중앙 90% 구간)
-        if not (sum_lo <= f["sum"] <= sum_hi):
-            continue
-        if not (2 <= f["odd"] <= 4):
-            continue
-        if not (2 <= f["low"] <= 4):
-            continue
-        if f["consec"] > 1:
-            continue
-        if f["decades"] < 3:
-            continue
-        if f["le31"] == 6:      # 전원 생일범위 → 분할 위험 최대, 배제
-            continue
-        if c in a["history_sets"]:  # 역대 1등 조합 재출현 배제(대중이 재구매하는 조합)
-            continue
-        if len(set(c) & set(a["last_draw"])) >= 4:
-            continue
-        cands.append(c)
-        if len(seen) > pool_size * 20:
-            break
-
-    # 인기도(예측 분할 위험) 오름차순 정렬 → 상위 10% 후보군에서 무작위 선별
-    # (엄격 최소화는 조합이 한 형태로 수렴하므로, 저인기 구간 내 다양성을 확보)
-    scored = sorted(cands, key=lambda c: popularity_score(c, a["pop_coef"], a["sum_mean"]))
-    top = scored[:max(n_sets * 40, len(scored) // 10)]
-    rng.shuffle(top)
-    picked: list[tuple] = []
-    for c in top:
-        if all(len(set(c) & set(p)) <= 2 for p in picked):
-            picked.append(c)
-        if len(picked) == n_sets:
-            break
-    return [{
-        "nums": p,
-        "pop": popularity_score(p, a["pop_coef"], a["sum_mean"]),
-        **combo_features(p),
-    } for p in picked]
-
-
-def analyze_pension(df: pd.DataFrame) -> dict:
-    digits = np.array([[int(ch) for ch in s] for s in df["num"]])
-    pos_freq = [Counter(digits[:, i]) for i in range(6)]
-    jo_freq = Counter(df["jo"])
-    # 자리별 균등성 검정
-    pvals = []
-    for i in range(6):
-        obs = np.array([pos_freq[i].get(d, 0) for d in range(10)])
-        pvals.append(stats.chisquare(obs).pvalue)
-    jo_obs = np.array([jo_freq.get(j, 0) for j in range(1, 6)])
-    jo_p = stats.chisquare(jo_obs).pvalue
-    return {"n": len(df), "latest": int(df["epsd"].max()),
-            "pos_freq": pos_freq, "jo_freq": jo_freq, "pos_pvals": pvals, "jo_p": jo_p}
-
-
-PENSION_N = 20  # 품절이 잦아 예비 후보를 넉넉히 뽑는다
-
-
-def generate_pension(a: dict, n: int = PENSION_N, seed: int | None = None) -> list[dict]:
-    """순위가 매겨진 후보 n개 생성.
-
-    연금복권은 조·번호 조합이 전국에 1장씩만 존재해 이미 팔린 조합은 살 수 없다.
-    따라서 (1) 후보를 넉넉히 뽑고 (2) 조를 5개에 고르게 돌려 배정한다 —
-    특정 조가 통째로 매진돼도 남은 조에 대안이 항상 n*4/5개 남는다.
-    순위 기준은 자리별 미달빈도 가중 점수이며, 실제 당첨 확률은 모든 조합이 동일하다.
-    """
-    rng = random.Random(seed)
-    weights = []
-    for i in range(6):
-        obs = np.array([a["pos_freq"][i].get(d, 0) for d in range(10)])
-        weights.append((obs.mean() * 2 - obs).clip(min=1).astype(float))
-
-    # 번호(6자리)만 점수순으로 뽑고, 조는 뒤에서 균등 배정한다.
-    pool, seen = [], set()
-    for _ in range(max(2000, n * 100)):
-        num = tuple(rng.choices(range(10), weights=weights[i])[0] for i in range(6))
-        if num in seen:
-            continue
-        seen.add(num)
-        pool.append({"num": num, "score": float(sum(weights[i][num[i]] for i in range(6)))})
-    pool.sort(key=lambda p: -p["score"])
-
-    picked: list[dict] = []
-    for p in pool:  # 후보 간 자리 일치 ≤3 (비슷한 번호가 몰리지 않도록)
-        if len(picked) >= n:
-            break
-        if any(sum(1 for i in range(6) if p["num"][i] == q["num"][i]) > 3 for q in picked):
-            continue
-        picked.append(p)
-    for p in pool:  # 모자라면 제약 완화해 채움
-        if len(picked) >= n:
-            break
-        if p not in picked:
-            picked.append(p)
-
-    # 조 라운드로빈 배정: 5개 단위로 1~5조를 한 번씩(순서는 매회 섞어 편향 방지)
-    jos: list[int] = []
-    while len(jos) < len(picked):
-        jos.extend(rng.sample(range(1, 6), 5))
-    return [{"rank": i + 1, "jo": jos[i], "num": "".join(map(str, p["num"]))}
-            for i, p in enumerate(picked)]
-
-
-# ──────────────────────────────── 리포트 ────────────────────────────────
-
-def fmt_nums(nums) -> str:
-    return " ".join(f"{n:2d}" for n in nums)
-
+# ──────────────────────────────── 날짜 ────────────────────────────────
 
 WEEKDAY_KR = "월화수목금토일"
 
 
-def draw_date_for(df: pd.DataFrame, target: int) -> str:
+def draw_date_for(df: pd.DataFrame, target: int) -> date:
     """대상 회차의 추첨일 = 마지막 추첨일 + 7일 × 회차 차이.
     로또·연금 모두 창설 이래 예외 없이 주 1회다(전 회차 간격 7일 검증됨).
     '다음 토요일'식 계산은 추첨 직후 실행 시 당일을 반환해 7일 어긋난다."""
     last = df.iloc[-1]
     d = datetime.strptime(str(int(last["date"])), "%Y%m%d").date()
-    d += timedelta(days=7 * (int(target) - int(last["epsd"])))
+    return d + timedelta(days=7 * (int(target) - int(last["epsd"])))
+
+
+def fmt_date(d: date) -> str:
     return f"{d:%Y-%m-%d}({WEEKDAY_KR[d.weekday()]})"
 
 
-def run_report(n_sets: int, seed: int | None, n_pension: int = PENSION_N):
+# ──────────────────────────────── 번호 인기도 모형 ────────────────────────────────
+#
+# 균등 무작위 구매라면 5등(3개 일치) 당첨자 기대값 = 판매게임수 × P(3개 일치)로 정확히 정해진다.
+# 실제 5등이 기대보다 많았다면 그 회차 당첨번호가 사람들이 많이 고른 번호였다는 뜻이다.
+# 회당 ~270만 명이라 잡음이 거의 없어, '어느 번호가 포함되면 배율이 오르는가'를 능형회귀로
+# 역산하면 번호별 인기도가 나온다. 조합의 1등 동반당첨 배율 ≈ exp(2 × Σ번호 인기도)
+# (5등은 6개 중 3개 부분집합의 인기를 반영하므로 6개 전체에는 약 2배로 작용 — 검증 구간에서
+# 기울기 2가 포아송 로그우도 최대였다).
+
+def lotto_games(df: pd.DataFrame) -> pd.Series:
+    return df["sales"] / np.where(df["epsd"] <= 87, 2000, 1000)   # 2004-08 이전 1게임 2,000원
+
+
+def number_matrix(df: pd.DataFrame) -> np.ndarray:
+    X = np.zeros((len(df), 45))
+    nums = df[NUM_COLS].to_numpy(dtype=int)
+    X[np.arange(len(df))[:, None], nums - 1] = 1
+    return X
+
+
+def fit_popularity(df: pd.DataFrame, window: int = 520, lam: float = 20.0) -> np.ndarray:
+    """최근 window회로 번호별 인기도(log 배율 기여, 평균 0으로 중심화)를 추정."""
+    d = df.dropna(subset=["r5_n", "sales"]).tail(window)
+    y = np.log(d["r5_n"].to_numpy() / (lotto_games(d).to_numpy() * P_RANK5))
+    X = number_matrix(d)
+    beta = np.linalg.solve(X.T @ X + lam * np.eye(45), X.T @ (y - y.mean()))
+    return beta - beta.mean()
+
+
+def split_mult(combo, beta: np.ndarray) -> float:
+    """예상 1등 동반당첨자 배율 (무작위 조합 평균 ≈ 1.00, 낮을수록 당첨 시 몫이 큼)."""
+    return float(np.exp(2 * beta[np.asarray(combo) - 1].sum()))
+
+
+def validate_popularity(df: pd.DataFrame, test_n: int = 200) -> dict:
+    """표본 외 검증: 검증 구간 직전까지로 학습 → 검증 구간 5등 배율 예측 상관,
+    그리고 당첨번호 인기도 5분위별 실제 1등 당첨자 배율."""
+    d = df.dropna(subset=["r5_n", "sales"]).reset_index(drop=True)
+    train, test = d.iloc[:-test_n], d.iloc[-test_n:]
+    beta = fit_popularity(train)
+    y = np.log(test["r5_n"] / (lotto_games(test) * P_RANK5))
+    pred = number_matrix(test) @ beta
+    r = stats.pearsonr(pred, y)
+
+    recent = d.tail(544)
+    b_all = fit_popularity(d)
+    score = number_matrix(recent) @ b_all
+    exp1 = lotto_games(recent) * P_MATCH[6]
+    q = pd.qcut(score, 5, labels=False)
+    quint = [float(recent["rank1_winners"][q == k].sum() / exp1[q == k].sum()) for k in range(5)]
+    return {"r": float(r.statistic), "p": float(r.pvalue), "n_test": test_n,
+            "quintile_r1": quint, "n_quint": len(recent)}
+
+
+# ──────────────────────────────── 로또 엔진 v2 ────────────────────────────────
+
+def is_pattern(c) -> bool:
+    """사람들이 일부러 고르는 모양(분할 위험 큼): 등차수열(용지의 가로·세로·대각선 포함), 4연속 이상."""
+    s = sorted(c)
+    d = [b - a for a, b in zip(s, s[1:])]
+    if len(set(d)) == 1:
+        return True
+    run = best = 1
+    for x in d:
+        run = run + 1 if x == 1 else 1
+        best = max(best, run)
+    return best >= 4
+
+
+def generate_lotto(beta: np.ndarray, n_sets: int = 5, strength: float = STRENGTH_DEFAULT,
+                   rng: np.random.Generator | None = None, hist: frozenset = frozenset(),
+                   last: tuple = ()) -> list[tuple]:
+    """5세트(30개 번호) 단위 블록마다 번호를 겹치지 않게, 구간 비율대로 뽑는다.
+    구간 안에서는 인기 번호일수록 덜 뽑히게(가중치 exp(-strength·z)) 해서 분할을 피한다.
+    30개를 6개씩 나누는 여러 방법 중 패턴·역대 1등 조합을 피하면서 분할위험 합이 최소인 것을 쓴다."""
+    rng = rng or np.random.default_rng()
+    z = (beta - beta.mean()) / (beta.std() + 1e-12)
+    w = np.exp(-strength * z)
+    out: list[tuple] = []
+    while len(out) < n_sets:
+        k = min(5, n_sets - len(out))
+        need = 6 * k
+        raw = np.array([(hi - lo + 1) * need / 45 for lo, hi in RANGES])
+        quota = np.floor(raw).astype(int)
+        frac = raw - quota
+        rem = need - quota.sum()
+        if rem:
+            quota[rng.choice(len(RANGES), rem, replace=False, p=frac / frac.sum())] += 1
+        chosen = []
+        for (lo, hi), cnt in zip(RANGES, quota):
+            nums = np.arange(lo, hi + 1)
+            p = w[nums - 1] / w[nums - 1].sum()
+            chosen += [int(v) for v in rng.choice(nums, cnt, replace=False, p=p)]
+        best, best_cost = None, np.inf
+        for _ in range(400):
+            perm = rng.permutation(chosen)
+            sets = [tuple(sorted(int(v) for v in perm[i * 6:(i + 1) * 6])) for i in range(k)]
+            if any(is_pattern(s) or s in hist or len(set(s) & set(last)) >= 4 for s in sets):
+                continue
+            if any(len({(v - 1) // 10 for v in s}) < 3 for s in sets):
+                continue
+            cost = sum(split_mult(s, beta) for s in sets)
+            if cost < best_cost:
+                best, best_cost = sets, cost
+        if best:
+            out += best
+    return out[:n_sets]
+
+
+def generate_random(rng: np.random.Generator, n_sets: int = 5) -> list[tuple]:
+    """대조군: 완전 무작위. 엔진이 '맞히는 능력'이 무작위와 같다는 것을 매주 실전으로 보여준다."""
+    return [tuple(sorted(int(v) for v in rng.choice(45, 6, replace=False) + 1)) for _ in range(n_sets)]
+
+
+# ──────────────────────────────── 연금 엔진 v2 ────────────────────────────────
+
+def generate_pension(n: int = PENSION_N, rng: np.random.Generator | None = None) -> list[dict]:
+    """품절 대비 순위 후보 n개.
+
+    연금 1등은 1장당 고정 연금이라 나눠 갖지 않는다 → 인기도 모형이 필요 없고, 번호는 균등 무작위.
+    대신 등수가 '끝자리부터 몇 자리 일치'로 정해지므로 끝자리를 분산한다:
+      - 10순위 단위로 끝자리 0~9를 한 번씩 → 앞에서 10장을 사면 매주 7등(끝 1자리) 이상 확정
+      - 끝 2자리는 전 후보가 서로 다름 → 6등 이상 확률 = 산 장수 × 1%
+      - 조는 5순위 단위로 1~5조 한 번씩 → 한 조가 통째로 매진돼도 대안이 남는다
+    (v1은 자리별 '미달빈도' 점수 정렬로 끝자리 4가 후보의 64%를 차지했다.)"""
+    rng = rng or np.random.default_rng()
+    tails: list[int] = []
+    while len(tails) < n:
+        tails += [int(v) for v in rng.permutation(10)]
+    jos: list[int] = []
+    while len(jos) < n:
+        jos += [int(v) for v in rng.permutation(5) + 1]
+    used2, out = set(), []
+    for i in range(n):
+        while True:
+            head = [int(v) for v in rng.integers(0, 10, 5)]
+            last2 = (head[4], tails[i])
+            if last2 not in used2 or len(used2) >= 100:
+                break
+        used2.add(last2)
+        out.append({"rank": i + 1, "jo": jos[i], "num": "".join(map(str, head + [tails[i]]))})
+    return out
+
+
+# ──────────────────────────────── 추천 기록부 ────────────────────────────────
+# 회차당 한 번만 생성해 기록한다 (v1은 실행할 때마다 새로 뽑아 '무엇을 추천했는지'가 남지 않았다).
+# 시트는 이 파일을 GitHub 미러에서 가져가므로 리포트·시트가 항상 같은 번호를 보여준다.
+
+LOTTO_PICK_COLS = ["created", "target", "draw_date", "engine", "strategy", "set", *NUM_COLS, "split_mult"]
+PENSION_PICK_COLS = ["created", "target", "draw_date", "engine", "rank", "jo", "num"]
+
+
+def _read(path: str, cols: list[str], **kw) -> pd.DataFrame:
+    if os.path.exists(path):
+        return pd.read_csv(path, **kw)
+    return pd.DataFrame(columns=cols)
+
+
+def ensure_picks(lotto: pd.DataFrame, pension: pd.DataFrame, n_sets: int, n_pension: int,
+                 strength: float) -> tuple[pd.DataFrame, pd.DataFrame, bool]:
+    lp = _read(LOTTO_PICKS_CSV, LOTTO_PICK_COLS)
+    pp = _read(PENSION_PICKS_CSV, PENSION_PICK_COLS, dtype={"num": str})
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    changed = False
+
+    target = int(lotto["epsd"].max()) + 1
+    have = lp[(lp["target"] == target) & (lp["engine"] == ENGINE)]
+    if have.empty:
+        beta = fit_popularity(lotto)
+        rng = np.random.default_rng(target * 7919)
+        hist = frozenset(tuple(sorted(r)) for r in lotto[NUM_COLS].to_numpy(dtype=int))
+        last = tuple(int(v) for v in lotto.iloc[-1][NUM_COLS])
+        dd = draw_date_for(lotto, target).isoformat()
+        rows = []
+        for strategy, sets in (("공식", generate_lotto(beta, n_sets, strength, rng, hist, last)),
+                               ("대조군", generate_random(rng, n_sets))):
+            for i, s in enumerate(sets):
+                rows.append({"created": now, "target": target, "draw_date": dd, "engine": ENGINE,
+                             "strategy": strategy, "set": chr(65 + i), **dict(zip(NUM_COLS, s)),
+                             "split_mult": round(split_mult(s, beta), 4)})
+        lp = pd.concat([lp, pd.DataFrame(rows)], ignore_index=True)
+        changed = True
+
+    ptarget = int(pension["epsd"].max()) + 1
+    if pp[(pp["target"] == ptarget) & (pp["engine"] == ENGINE)].empty:
+        dd = draw_date_for(pension, ptarget).isoformat()
+        rows = [{"created": now, "target": ptarget, "draw_date": dd, "engine": ENGINE, **c}
+                for c in generate_pension(n_pension, np.random.default_rng(ptarget * 104729))]
+        pp = pd.concat([pp, pd.DataFrame(rows)], ignore_index=True)
+        changed = True
+
+    if changed:
+        lp[LOTTO_PICK_COLS].to_csv(LOTTO_PICKS_CSV, index=False)
+        pp[PENSION_PICK_COLS].to_csv(PENSION_PICKS_CSV, index=False)
+    return lp, pp, changed
+
+
+def backfill_v1_from_log(lotto: pd.DataFrame, pension: pd.DataFrame) -> None:
+    """v1 시절 추천을 로그에서 복원해 기록부에 넣는다 (성적 비교용, 1회성).
+    회차별로 '추첨 전에 생성된 마지막 추천'만 인정한다 — 추첨 뒤 생성분은 결과를 알고 만든 것이 아니지만
+    사용자가 볼 수 없었던 번호이므로 제외한다."""
+    if not os.path.exists(LOG_FILE):
+        return
+    lp = _read(LOTTO_PICKS_CSV, LOTTO_PICK_COLS)
+    pp = _read(PENSION_PICKS_CSV, PENSION_PICK_COLS, dtype={"num": str})
+    if (lp["engine"] == "v1").any() or (pp["engine"] == "v1").any():
+        return
+    log = open(LOG_FILE, encoding="utf-8", errors="replace").read()
+    lrows, prows = {}, {}
+    for block in re.split(r"^생성: ", log, flags=re.M)[1:]:
+        created = datetime.strptime(block[:16], "%Y-%m-%d %H:%M")
+        m = re.search(r"로또 (\d+)회차", block)
+        if m:
+            t = int(m.group(1))
+            dd = draw_date_for(lotto, t)
+            sets = re.findall(r"^- [A-E]세트: \*\*([\d ]+)\*\*", block, re.M)
+            if len(sets) >= 5 and created < datetime.combine(dd, datetime.min.time()) + timedelta(hours=20):
+                lrows[t] = [{"created": created.strftime("%Y-%m-%d %H:%M"), "target": t,
+                             "draw_date": dd.isoformat(), "engine": "v1", "strategy": "공식",
+                             "set": chr(65 + i), **dict(zip(NUM_COLS, map(int, s.split()))),
+                             "split_mult": np.nan} for i, s in enumerate(sets[:5])]
+        m = re.search(r"연금복권 720\+ 추천 \((\d+)회차", block)
+        if m:
+            t = int(m.group(1))
+            dd = draw_date_for(pension, t)
+            cands = re.findall(r"\| (\d+) \| (\d)조 \| \*\*(\d{6})\*\*", block)
+            cands += re.findall(r"^- (\d+)순위: \*\*(\d)조 (\d{6})\*\*", block, re.M)
+            if cands and created < datetime.combine(dd, datetime.min.time()) + timedelta(hours=19):
+                prows[t] = [{"created": created.strftime("%Y-%m-%d %H:%M"), "target": t,
+                             "draw_date": dd.isoformat(), "engine": "v1", "rank": int(r),
+                             "jo": int(j), "num": n} for r, j, n in sorted(cands, key=lambda x: int(x[0]))]
+    if lrows:
+        lp = pd.concat([pd.DataFrame([r for t in sorted(lrows) for r in lrows[t]]), lp], ignore_index=True)
+        lp[LOTTO_PICK_COLS].to_csv(LOTTO_PICKS_CSV, index=False)
+    if prows:
+        pp = pd.concat([pd.DataFrame([r for t in sorted(prows) for r in prows[t]]), pp], ignore_index=True)
+        pp[PENSION_PICK_COLS].to_csv(PENSION_PICKS_CSV, index=False)
+    print(f"[기록부] v1 추천 복원: 로또 {len(lrows)}회차 · 연금 {len(prows)}회차")
+
+
+# ──────────────────────────────── 채점 ────────────────────────────────
+
+def lotto_rank(hits: int, bonus_hit: bool) -> str:
+    return {6: "1등", 5: "2등" if bonus_hit else "3등", 4: "4등", 3: "5등"}.get(hits, "낙첨")
+
+
+def pension_rank(num: str, jo: int, win: dict) -> tuple[int, str]:
+    m = 0
+    while m < 6 and num[5 - m] == win["num"][5 - m]:
+        m += 1
+    rank = {6: "1등" if jo == win["jo"] else "2등", 5: "3등", 4: "4등", 3: "5등", 2: "6등", 1: "7등"}.get(m, "낙첨")
+    return m, rank
+
+
+def grade(lp: pd.DataFrame, pp: pd.DataFrame, lotto: pd.DataFrame, pension: pd.DataFrame):
+    win = {int(r["epsd"]): (set(int(r[c]) for c in NUM_COLS), int(r["bonus"])) for _, r in lotto.iterrows()}
+    g = lp[lp["target"].isin(win)].copy()
+    picked = [{int(v) for v in row} for row in g[NUM_COLS].to_numpy()]
+    g["hits"] = [len(win[int(t)][0] & s) for t, s in zip(g["target"], picked)]
+    g["bonus_hit"] = [win[int(t)][1] in s for t, s in zip(g["target"], picked)]
+    g["rank"] = [lotto_rank(h, b) for h, b in zip(g["hits"], g["bonus_hit"])]
+
+    pwin = {int(r["epsd"]): {"jo": int(r["jo"]), "num": str(r["num"]).zfill(6)} for _, r in pension.iterrows()}
+    pg = pp[pp["target"].isin(pwin)].copy()
+    res = [pension_rank(str(n).zfill(6), int(j), pwin[int(t)]) for n, j, t in zip(pg["num"], pg["jo"], pg["target"])]
+    pg["tail"] = [m for m, _ in res]
+    pg["rank_result"] = [r for _, r in res]
+    return g, pg
+
+
+def scoreboard(g: pd.DataFrame, pg: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for (eng, strat), d in g.groupby(["engine", "strategy"]):
+        n = len(d)
+        rows.append({"game": "로또", "group": f"{eng} {strat}", "draws": d["target"].nunique(), "tickets": n,
+                     "avg_hits": round(d["hits"].mean(), 3), "theory_avg": 0.8,
+                     "prize_count": int((d["hits"] >= 3).sum()),
+                     "theory_prize": round(n * sum(P_MATCH[k] for k in (3, 4, 5, 6)), 2),
+                     "detail": " ".join(f"{k}개:{int((d['hits'] == k).sum())}" for k in range(7) if (d["hits"] == k).any())})
+    for eng, d in pg.groupby("engine"):
+        n = len(d)
+        rows.append({"game": "연금", "group": f"{eng} 후보 전체", "draws": d["target"].nunique(), "tickets": n,
+                     "avg_hits": round(d["tail"].mean(), 3), "theory_avg": round(sum(0.1 ** k for k in range(1, 7)), 3),
+                     "prize_count": int((d["tail"] >= 1).sum()), "theory_prize": round(n * 0.1, 2),
+                     "detail": " ".join(f"끝{k}자리:{int((d['tail'] == k).sum())}" for k in range(1, 7) if (d["tail"] == k).any())})
+    return pd.DataFrame(rows)
+
+
+# ──────────────────────────────── 참고 통계 ────────────────────────────────
+
+def reference_stats(df: pd.DataFrame) -> dict:
+    nums = df[NUM_COLS].to_numpy(dtype=int)
+    freq = Counter(nums.ravel())
+    obs = np.array([freq.get(i, 0) for i in range(1, 46)])
+    chi2, pval = stats.chisquare(obs)
+    latest = int(df["epsd"].max())
+    last_seen = {}
+    for e, row in zip(df["epsd"], nums):
+        for n in row:
+            last_seen[int(n)] = int(e)
+    return {"chi2": chi2, "pval": pval, "freq": freq,
+            "overdue": {i: latest - last_seen.get(i, 0) for i in range(1, 46)}}
+
+
+def pension_uniformity(df: pd.DataFrame) -> list[float]:
+    digits = np.array([[int(ch) for ch in s] for s in df["num"]])
+    return [stats.chisquare(np.bincount(digits[:, i], minlength=10)).pvalue for i in range(6)]
+
+
+# ──────────────────────────────── 리포트 ────────────────────────────────
+
+def fmt_nums(nums) -> str:
+    return " ".join(f"{int(n):2d}" for n in nums)
+
+
+def run_report(n_sets: int, n_pension: int, strength: float) -> None:
     lotto = pd.read_csv(LOTTO_CSV)
-    pension = pd.read_csv(PENSION_CSV, dtype={"num": str, "bonus": str})
-    a = analyze_lotto(lotto)
-    p = analyze_pension(pension)
+    pension = load_pension()
+    backfill_v1_from_log(lotto, pension)
+    lp, pp, _ = ensure_picks(lotto, pension, n_sets, n_pension, strength)
+    g, pg = grade(lp, pp, lotto, pension)
+    sb = scoreboard(g, pg)
+    sb.to_csv(SCOREBOARD_CSV, index=False)
 
-    lines = []
-    w = lines.append
-    w(f"# 로또 6/45 · 연금복권 720+ 통계 분석 리포트")
-    w(f"생성: {datetime.now():%Y-%m-%d %H:%M} / 로또 {a['n_draws']}회(~{a['latest']}회) · 연금 {p['n']}회(~{p['latest']}회)\n")
+    beta = fit_popularity(lotto)
+    pop = pd.DataFrame({"number": range(1, 46), "popularity": np.round(np.exp(beta), 4)})
+    pop["rank"] = pop["popularity"].rank(ascending=False, method="min").astype(int)
+    pop.to_csv(POPULARITY_CSV, index=False)
+    val = validate_popularity(lotto)
+    ref = reference_stats(lotto)
 
-    w("## 1. 무작위성 검증 (정직 고지)")
-    w(f"- 로또 번호 균등성 카이제곱 검정: chi2={a['chi2']:.1f}, p={a['pval']:.3f}")
-    w(f"  → p>0.05이면 역대 출현 빈도는 완전 무작위와 통계적으로 구별 불가 = '뜨거운 번호'는 노이즈.")
-    w(f"- 연금복권 자리별 p값: {', '.join(f'{v:.2f}' for v in p['pos_pvals'])} / 조 p={p['jo_p']:.2f}\n")
+    lt = int(lotto["epsd"].max()) + 1
+    pt = int(pension["epsd"].max()) + 1
+    cur = lp[(lp["target"] == lt) & (lp["engine"] == ENGINE)]
+    official = cur[cur["strategy"] == "공식"]
+    control = cur[cur["strategy"] == "대조군"]
+    pcur = pp[(pp["target"] == pt) & (pp["engine"] == ENGINE)].sort_values("rank")
 
-    top10 = sorted(a["freq"].items(), key=lambda kv: -kv[1])[:10]
-    bot10 = sorted(a["freq"].items(), key=lambda kv: kv[1])[:10]
-    hot = sorted(a["rfreq"].items(), key=lambda kv: -kv[1])[:10]
-    od = sorted(a["overdue"].items(), key=lambda kv: -kv[1])[:10]
-    w("## 2. 빈도·미출현 (참고용 — 위 검정에 따라 예측력 없음)")
-    w(f"- 역대 최다 출현: {', '.join(f'{n}({c})' for n, c in top10)}")
-    w(f"- 역대 최소 출현: {', '.join(f'{n}({c})' for n, c in bot10)}")
-    w(f"- 최근 {a['recent_n']}회 HOT: {', '.join(f'{n}({c})' for n, c in hot)}")
-    w(f"- 최장 미출현: {', '.join(f'{n}번({c}회)' for n, c in od)}")
-    w(f"- 동반출현 최다 짝: {', '.join(f'{a}-{b}({c})' for (a, b), c in a['pairs_top'][:6])}\n")
+    L = []
+    w = L.append
+    w("# 로또 6/45 · 연금복권 720+ 리포트 (엔진 v2)")
+    w(f"생성: {datetime.now():%Y-%m-%d %H:%M} / 데이터 로또 ~{lt - 1}회 · 연금 ~{pt - 1}회\n")
 
-    f = a["feats"]
-    w("## 3. 역대 1등 조합의 통계 프로파일 (생성 필터 근거)")
-    w(f"- 합계: 평균 {f['sum'].mean():.0f}, 중앙 90% 구간 [{a['sum_range'][0]:.0f}, {a['sum_range'][1]:.0f}]")
-    w(f"- 홀수 개수 분포: {dict(sorted(Counter(f['odd']).items()))}")
-    w(f"- 연속수 쌍 분포: {dict(sorted(Counter(f['consec']).items()))}\n")
-
-    w("## 4. 조합 인기도 모형 (분할 회피 = 유일한 실질 엣지)")
-    w(f"- 회차별 1등 당첨자 수(판매량 보정)를 조합 특성으로 회귀. R²={a['pop_r2']:.3f}")
-    c = a["pop_coef"]
-    w(f"- 계수: 생일범위(≤31) 개수 {c[1]:+.3f}, 연속쌍 {c[2]:+.3f}, 홀수개수 {c[3]:+.3f}, "
-      f"합계이탈 {c[4]:+.3f}, 구간다양성 {c[5]:+.3f}")
-    w(f"  → 양(+)의 계수 특성이 많은 조합일수록 당첨자가 많았음(상금 분할↑). 생성기는 이 점수를 최소화.\n")
-
-    sets = generate_sets(a, n_sets=n_sets, seed=seed)
-    lotto_target = a["latest"] + 1
-    w(f"## 5. 이번 주 추천 조합 (로또 {lotto_target}회차 — {draw_date_for(lotto, lotto_target)} 추첨, {n_sets}세트)")
-    w("프로파일 필터 통과 + 예측 인기도(분할 위험) 최소화 + 세트 간 중복 ≤2")
-    for i, s in enumerate(sets, 1):
-        w(f"- {chr(64+i)}세트: **{fmt_nums(s['nums'])}**  (합 {s['sum']}, 홀 {s['odd']}, 인기도 {s['pop']:+.2f})")
+    w(f"## 1. 로또 {lt}회 추천 — {fmt_date(draw_date_for(lotto, lt))} 추첨")
+    w("30개 번호를 겹치지 않게, 번호 구간 비율대로 배치 + 인기 번호를 덜 골라 1등 분할 회피")
     w("")
+    w("| 세트 | 번호 | 예상 분할배율 |")
+    w("|:--:|:--|--:|")
+    for _, r in official.iterrows():
+        w(f"| {r['set']} | **{fmt_nums(r[NUM_COLS])}** | {r['split_mult']:.2f} |")
+    w("")
+    w("분할배율: 1등 당첨 시 함께 당첨될 것으로 예상되는 인원의 배율 (무작위 조합 평균 = 1.00, 낮을수록 몫이 큼)\n")
 
-    pns = generate_pension(p, n=n_pension, seed=seed)
-    pen_target = p["latest"] + 1
-    w(f"## 6. 연금복권 720+ 추천 ({pen_target}회차 — {draw_date_for(pension, pen_target)} 추첨, "
-      f"품절 대비 {len(pns)}순위)")
-    w("조·번호 조합은 전국에 1장씩만 존재해 이미 팔린 것은 살 수 없다. 앞 순위가 품절이면 다음 순위로.")
-    w("조는 1~5조에 고르게 배정되어 있어, 한 조가 통째로 매진돼도 대안이 남는다.")
+    w(f"## 2. 연금복권 {pt}회 추천 — {fmt_date(draw_date_for(pension, pt))} 추첨 (품절 대비 {len(pcur)}순위)")
+    w("앞 순위가 품절이면 다음 순위로. 끝자리가 10순위 단위로 0~9를 한 번씩 덮어, 앞에서 10장을 사면 7등 이상 확정.")
     w("")
     w("| 순위 | 조 | 번호 | 순위 | 조 | 번호 |")
     w("|---:|:--:|:--|---:|:--:|:--|")
-    half = (len(pns) + 1) // 2
+    rows = list(pcur.itertuples())
+    half = (len(rows) + 1) // 2
     for i in range(half):
-        left = pns[i]
-        cells = [str(left["rank"]), f"{left['jo']}조", f"**{left['num']}**"]
-        if i + half < len(pns):
-            right = pns[i + half]
-            cells += [str(right["rank"]), f"{right['jo']}조", f"**{right['num']}**"]
+        a = rows[i]
+        cells = [str(a.rank), f"{a.jo}조", f"**{str(a.num).zfill(6)}**"]
+        if i + half < len(rows):
+            b = rows[i + half]
+            cells += [str(b.rank), f"{b.jo}조", f"**{str(b.num).zfill(6)}**"]
         else:
             cells += ["", "", ""]
         w("| " + " | ".join(cells) + " |")
     w("")
-    by_jo = Counter(x["jo"] for x in pns)
-    w(f"조별 후보 수: {', '.join(f'{j}조 {by_jo.get(j, 0)}개' for j in range(1, 6))}\n")
 
-    w("> ⚠️ 본 리포트의 어떤 항목도 당첨 확률 자체를 높이지 않는다. 5번 항목의 분할 회피만이")
-    w("> '당첨됐을 때 더 많이 받는' 방향의 실질적 최적화다. 구매는 여유 자금 내에서.")
+    w("## 3. 성적표 (실전 기록)")
+    last_t = int(lotto["epsd"].max())
+    lastg = g[(g["target"] == last_t) & (g["strategy"] == "공식")]
+    if not lastg.empty:
+        wn = sorted(int(v) for v in lotto.iloc[-1][NUM_COLS])
+        w(f"- 직전 {last_t}회 당첨번호 **{fmt_nums(wn)}** + 보너스 {int(lotto.iloc[-1]['bonus'])}")
+        for _, r in lastg.iterrows():
+            mark = " ".join(f"[{int(n)}]" if int(n) in wn else str(int(n)) for n in r[NUM_COLS])
+            w(f"  - {r['engine']} {r['set']}세트: {mark} → {r['hits']}개 {r['rank']}")
+    w("")
+    w("| 구분 | 회차 | 장수 | 평균 적중 | 이론 | 당첨(5등↑/7등↑) | 이론 기대 | 적중 분포 |")
+    w("|---|--:|--:|--:|--:|--:|--:|---|")
+    for _, r in sb.iterrows():
+        w(f"| {r['game']} {r['group']} | {r['draws']} | {r['tickets']} | {r['avg_hits']:.2f} | {r['theory_avg']:.2f} "
+          f"| {r['prize_count']} | {r['theory_prize']:.1f} | {r['detail']} |")
+    w("")
+    w("대조군 = 같은 주에 완전 무작위로 뽑은 5세트(구매용 아님). 공식 추천과 적중률이 같게 나오는 것이 정상이다 —")
+    w("어떤 방법도 적중 확률 자체는 바꾸지 못한다는 것을 매주 실전으로 확인하는 장치다.\n")
 
-    text = "\n".join(lines)
+    w("## 4. 엔진 검증")
+    if os.path.exists(BACKTEST_CSV):
+        bt = pd.read_csv(BACKTEST_CSV)
+        w(f"워크포워드 백테스트 — 과거 {int(bt['draws'].iloc[0])}회, 각 회차 직전 데이터만으로 추천 후 채점:\n")
+        w("| 엔진 | 평균 적중 | 5등↑ 세트 비율 | 주당 5등↑ 확률* | 분할배율 | 구간 최대편차 | 20번대 비중 |")
+        w("|---|--:|--:|--:|--:|--:|--:|")
+        for _, r in bt.iterrows():
+            w(f"| {r['engine']} | {r['avg_hits']:.3f} | {r['pct_prize']:.2f}% | {r['weekly_any_prize_mc']:.2f}% "
+              f"| {r['split_mult']:.3f} | {r['range_dev']:.1f}% | {r['share_20s']:.2f}x |")
+        w("\n\\* 몬테카를로 4만 회 추첨 기준(300주 실측은 표준오차 ±1.8%p라 구별 불가). 이론 평균 적중 0.800.\n")
+    w(f"번호 인기도 모형: 5등 배율 표본 외 예측 상관 **r={val['r']:.2f}** (검증 {val['n_test']}회, p={val['p']:.0e}).")
+    q = val["quintile_r1"]
+    w(f"당첨번호 인기도 5분위별 실제 1등 당첨자(기대 대비, 최근 {val['n_quint']}회): "
+      f"가장 비인기 {q[0]:.2f}x → {q[1]:.2f}x → {q[2]:.2f}x → {q[3]:.2f}x → 가장 인기 {q[4]:.2f}x\n")
+    top = pop.sort_values("popularity", ascending=False)
+    hi8, lo8 = top.head(8), top.tail(8).iloc[::-1]
+    w(f"- 가장 많이 찍히는 번호: {', '.join(f'{n}({v:.3f})' for n, v in zip(hi8['number'], hi8['popularity']))}")
+    w(f"- 가장 덜 찍히는 번호: {', '.join(f'{n}({v:.3f})' for n, v in zip(lo8['number'], lo8['popularity']))}")
+    w(f"- 분할 회피 강도 {strength} (0=무작위, 1 이상이면 인기 번호가 거의 안 나와 편중으로 보임)\n")
+
+    w("## 5. 참고 통계")
+    w(f"- 로또 번호 균등성 카이제곱: p={ref['pval']:.3f} → 역대 출현 빈도는 무작위와 구별 불가 ('뜨거운 번호'는 잡음)")
+    w(f"- 연금 자리별 균등성 p값: {', '.join(f'{v:.2f}' for v in pension_uniformity(pension))}")
+    od = sorted(ref["overdue"].items(), key=lambda kv: -kv[1])[:8]
+    w(f"- 최장 미출현(참고용, 예측력 없음): {', '.join(f'{n}번 {c}회' for n, c in od)}\n")
+    w("> ⚠️ 어떤 분석도 당첨 확률(1등 1/8,145,060)을 바꾸지 못한다. 이 엔진이 개선하는 것은 ① 당첨 시 몫(분할 회피)")
+    w("> ② 5세트가 같이 맞고 같이 틀리는 일을 줄이는 분산, 두 가지다. 구매는 여유 자금 내에서.")
+
+    text = "\n".join(L)
     with open(REPORT_MD, "w", encoding="utf-8") as fp:
         fp.write(text)
     print(text)
@@ -457,17 +610,17 @@ def run_report(n_sets: int, seed: int | None, n_pension: int = PENSION_N):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--update", action="store_true", help="데이터 갱신만 수행")
-    ap.add_argument("--no-fetch", action="store_true", help="저장된 데이터로 분석만")
+    ap.add_argument("--no-fetch", action="store_true", help="저장된 데이터로 추천·리포트만")
     ap.add_argument("--sets", type=int, default=5, help="로또 추천 세트 수")
     ap.add_argument("--pension", type=int, default=PENSION_N, help="연금 후보 수(품절 대비)")
-    ap.add_argument("--seed", type=int, default=None, help="재현 가능한 생성용 시드")
+    ap.add_argument("--strength", type=float, default=STRENGTH_DEFAULT, help="분할 회피 강도 (0~2)")
     args = ap.parse_args()
 
     if not args.no_fetch:
         update_lotto()
         update_pension()
     if not args.update:
-        run_report(args.sets, args.seed, args.pension)
+        run_report(args.sets, args.pension, args.strength)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,3 @@
+game,group,draws,tickets,avg_hits,theory_avg,prize_count,theory_prize,detail
+로또,v1 공식,11,55,0.836,0.8,1,1.31,0개:22 1개:21 2개:11 3개:1
+연금,v1 후보 전체,10,172,0.064,0.111,10,17.2,끝1자리:9 끝2자리:1

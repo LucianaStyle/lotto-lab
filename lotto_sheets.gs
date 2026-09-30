@@ -1,94 +1,117 @@
 /**
- * 로또 6/45 + 연금복권 720+ 자동 분석 — Google Sheets (Apps Script)
+ * 로또 6/45 + 연금복권 720+ 대시보드 — Google Sheets (Apps Script) · 엔진 v2 (2026-09)
  *
- * 설치:
- *  1. 스프레드시트를 열고 그 안에서 확장 프로그램 > Apps Script (반드시 시트에 바인딩된 프로젝트여야
- *     메뉴가 동작한다. script.google.com에서 만든 독립형 프로젝트는 getUi() 오류가 난다)
- *  2. 이 파일 전체를 붙여넣고 저장 → 시트로 돌아와 새로고침 → 메뉴에 [복권분석]이 생김
- *  3. [복권분석 > 전체 업데이트+추천] 최초 1회 실행 (권한 승인 필요)
- *  4. [복권분석 > 주간 자동실행 설치] → 매주 토 22시(로또)·목 22시(연금) 자동 갱신
+ * 설치 (시트 안에서):
+ *  1. 확장 프로그램 > Apps Script → 이 파일 전체로 교체 → 저장
+ *     (반드시 시트에 바인딩된 프로젝트. script.google.com의 독립형 프로젝트는 getUi() 오류)
+ *  2. 시트 새로고침 → [복권분석 > 지금 동기화] 1회 실행 (권한 승인)
+ *     첫 실행 때 자동 이전: 기존 추천 시트는 '로또추천_v1'·'연금추천_v1'로 보존되고,
+ *     로또이력은 판매액 오류를 고친 새 스키마로 다시 받는다.
+ *  3. [복권분석 > 자동 동기화 설치] → 3시간마다 자동 (추첨 결과 게시가 늦어도 다음 주기에 잡힌다)
  *
- * 시트 구성:
- *  로또이력 / 연금이력 — 원본 당첨 데이터 (연도·월 경계 구분선)
- *  통계               — 번호별 출현·미출현 + 조합 프로파일
- *  로또추천 / 연금추천 — 회차별 추천, 추첨 후 자동 채점(적중 번호 색칠)
- *  성적               — 누적 적중 성적표 (이론 기대값 대비)
+ * 구조 — 번호는 시트가 만들지 않는다:
+ *   로컬 PC의 lotto_lab.py(엔진 v2)가 추천을 회차당 1번 생성해 GitHub 미러에 올리고,
+ *   시트는 그것을 가져와 보여주고 채점한다. 그래서 리포트와 시트가 항상 같은 번호를 보여준다.
+ *   (동행복권은 해외 IP를 차단해 Apps Script가 직접 수집할 수도 없다 — "사용할 수 없는 주소")
  *
- * ⚠️ 동행복권은 해외 IP를 차단하므로 Apps Script의 직접 수집은 실패한다("사용할 수 없는 주소").
- *    → 로컬 PC(lotto_lab.py)가 갱신·푸시한 GitHub 미러 CSV에서 가져온다.
+ * 시트:
+ *   로또추천 / 연금추천   이번 주 추천 + 지난 회차 채점(맞은 번호 색칠)
+ *   성적                 엔진별 누적 성적 vs 이론 기대값
+ *   편중감시              번호 구간·번호별·연금 끝자리 분포 (균등=1.00) — v1 편중 재발 감시
+ *   번호인기도            5등 당첨자 수로 역산한 번호별 인기 (분할 회피의 근거)
+ *   검증                 워크포워드 백테스트 + 로컬 엔진 실전 기록(대조군 포함)
+ *   통계 / 로또이력 / 연금이력 / *_v1 (구 엔진 기록 보존)
  */
 
-var MIRROR_LOTTO_CSV = 'https://raw.githubusercontent.com/LucianaStyle/lotto-lab/main/data/lotto_history.csv';
-var MIRROR_PENSION_CSV = 'https://raw.githubusercontent.com/LucianaStyle/lotto-lab/main/data/pension_history.csv';
+var MIRROR = 'https://raw.githubusercontent.com/LucianaStyle/lotto-lab/main/data/';
+var FETCH_OPT = { muteHttpExceptions: true, headers: { 'Cache-Control': 'no-cache' } };
 
-var BASE = 'https://www.dhlottery.co.kr';
-var FETCH_OPT = {
-  headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' },
-  muteHttpExceptions: true
+var SH = {
+  LOTTO: '로또이력', PENSION: '연금이력', STATS: '통계',
+  PICK: '로또추천', PPICK: '연금추천', PICK_V1: '로또추천_v1', PPICK_V1: '연금추천_v1',
+  SCORE: '성적', BIAS: '편중감시', POP: '번호인기도', CHECK: '검증'
 };
+var TAB_ORDER = [SH.PICK, SH.PPICK, SH.SCORE, SH.BIAS, SH.POP, SH.CHECK, SH.STATS,
+                 SH.LOTTO, SH.PENSION, SH.PICK_V1, SH.PPICK_V1];
 
-// 시트 이름
-var SH_LOTTO = '로또이력', SH_PENSION = '연금이력', SH_STATS = '통계';
-var SH_PICK = '로또추천', SH_PPICK = '연금추천', SH_SCORE = '성적';
+var LOTTO_HEAD = ['회차', '추첨일', 'n1', 'n2', 'n3', 'n4', 'n5', 'n6', '보너스',
+                  '1등당첨자', '1등금액', '판매액', '2등', '3등', '4등', '5등'];
+var PENSION_HEAD = ['회차', '추첨일', '조', '번호', '보너스'];
 
-// 색상 — 적중 표시
-var C_HIT_BG = '#c6efce', C_HIT_FG = '#0b6b3a';   // 번호 일치(초록)
+// 추천 시트 레이아웃 (열 번호는 1부터)
+var LV2 = { head: ['생성일', '대상회차', '추첨일', '세트', 'n1', 'n2', 'n3', 'n4', 'n5', 'n6',
+                   '분할배율', '적중', '등수'], target: 2, date: 3, n1: 5, hit: 12, rank: 13 };
+var LV1 = { head: ['생성일', '대상회차', '추첨일', '세트', 'n1', 'n2', 'n3', 'n4', 'n5', 'n6',
+                   '합계', '홀수', '인기도', '적중', '등수'], target: 2, date: 3, n1: 5, hit: 14, rank: 15 };
+var PL = { head: ['생성일', '대상회차', '추첨일', '순위', '조', '번호', '적중자리', '등수'],
+           target: 2, date: 3, jo: 5, num: 6, hit: 7, rank: 8 };
+
+var RANGES = [[1, 9], [10, 19], [20, 29], [30, 39], [40, 45]];
+
+// 색상
+var C_HIT_BG = '#c6efce', C_HIT_FG = '#0b6b3a';     // 번호 일치(초록)
 var C_BONUS_BG = '#ffe08a', C_BONUS_FG = '#7a5200'; // 보너스 일치(호박)
-var C_MISS_BG = '#ffffff';
 var C_HEAD_BG = '#1f3864', C_HEAD_FG = '#ffffff';
+var C_SUB_BG = '#e8eef7';
 var C_GROUP_A = '#ffffff', C_GROUP_B = '#f2f6fc';   // 회차 그룹 교대 배경
-var C_PENDING = '#9aa0a6';                          // 미추첨 회색
+var C_PENDING = '#9aa0a6';
 
-var PICK_HEAD = ['생성일', '대상회차', '추첨일', '세트', 'n1', 'n2', 'n3', 'n4', 'n5', 'n6',
-                 '합계', '홀수', '인기도', '적중', '등수'];
-var PICK_N1 = 5;   // n1 열 위치(1-indexed)
-var PICK_HIT = 14, PICK_RANK = 15;
-
-var PPICK_HEAD = ['생성일', '대상회차', '추첨일', '순위', '조', '번호', '적중자리', '등수'];
-var PPICK_NUM = 6, PPICK_HIT = 7, PPICK_RANK = 8;
-var PENSION_N = 20;   // 연금 후보 수 — 조·번호 조합이 1장뿐이라 품절 대비로 넉넉히 뽑는다
-
-// ───────────────────────── 메뉴 ─────────────────────────
+// ───────────────────────── 메뉴 · 진입점 ─────────────────────────
 
 function onOpen() {
   SpreadsheetApp.getUi().createMenu('복권분석')
-    .addItem('전체 업데이트+추천', 'weeklyJob')
-    .addSeparator()
-    .addItem('데이터 갱신 (로또+연금)', 'updateAll')
-    .addItem('통계 재계산', 'buildStats')
-    .addItem('추천 번호 생성', 'buildPicks')
-    .addItem('추천 재생성 (중복 허용)', 'buildPicksForce')
-    .addSeparator()
-    .addItem('결과 채점 (적중 색칠)', 'gradeResults')
+    .addItem('지금 동기화 (데이터·추천·채점)', 'syncAll')
     .addItem('서식 다시 적용', 'beautifyAll')
     .addSeparator()
-    .addItem('주간 자동실행 설치', 'installTriggers')
+    .addItem('자동 동기화 설치 (3시간마다)', 'installTriggers')
     .addToUi();
 }
 
-function weeklyJob() {
-  updateLotto();
-  updatePension();
-  buildStats();
-  gradeResults();   // 새 결과가 들어왔으니 지난 추천부터 채점
-  buildPicks();     // 그 다음 회차 추천 생성
-  beautifyAll();
-}
+// 구버전 트리거(토·목 22시 weeklyJob)가 남아 있어도 동작하도록 이름을 유지한다
+function weeklyJob() { syncAll(); }
 
-function updateAll() { updateLotto(); updatePension(); beautifyAll(); }
+function syncAll() {
+  migrateV2_();
+  var changed = updateLotto() + updatePension() + importPicks_();
+  importAux_();
+  gradeAll_();
+  buildStats();
+  buildScore_();
+  buildBias_();
+  if (changed > 0) beautifyAll();
+  toast_('동기화 완료' + (changed ? ' — 신규 ' + changed + '건' : ' — 변경 없음'));
+}
 
 function installTriggers() {
   var ss = SpreadsheetApp.getActive();
-  // 트리거 시각은 스크립트 표준시 기준 — 한국 시간과 어긋나지 않도록 고정
   if (ss.getSpreadsheetTimeZone() !== 'Asia/Seoul') ss.setSpreadsheetTimeZone('Asia/Seoul');
   ScriptApp.getProjectTriggers().forEach(function (t) {
-    if (t.getHandlerFunction() === 'weeklyJob') ScriptApp.deleteTrigger(t);
+    var f = t.getHandlerFunction();
+    if (f === 'weeklyJob' || f === 'syncAll') ScriptApp.deleteTrigger(t);
   });
-  ScriptApp.newTrigger('weeklyJob').timeBased()
-    .onWeekDay(ScriptApp.WeekDay.SATURDAY).atHour(22).create();  // 로또 추첨(20:35) 후
-  ScriptApp.newTrigger('weeklyJob').timeBased()
-    .onWeekDay(ScriptApp.WeekDay.THURSDAY).atHour(22).create();  // 연금 추첨(19:05) 후
-  ss.toast('토 22시 / 목 22시 자동실행 설치 완료 (Asia/Seoul)');
+  ScriptApp.newTrigger('syncAll').timeBased().everyHours(3).create();
+  toast_('자동 동기화 설치 완료 — 3시간마다 (Asia/Seoul)');
+}
+
+// 1회성 이전: 구 추천 시트 보존 + 이력 재수집 + 트리거 교체
+function migrateV2_() {
+  var props = PropertiesService.getDocumentProperties();
+  if (props.getProperty('schema') === 'v2') return;
+  var ss = SpreadsheetApp.getActive();
+  [[SH.PICK, SH.PICK_V1], [SH.PPICK, SH.PPICK_V1]].forEach(function (p) {
+    var old = ss.getSheetByName(p[0]);
+    if (old && !ss.getSheetByName(p[1])) old.setName(p[1]);
+  });
+  var h = ss.getSheetByName(SH.LOTTO);
+  if (h) h.clear();                     // 판매액이 절반으로 들어간 구 스키마 → 전량 재수집
+  try {
+    ScriptApp.getProjectTriggers().forEach(function (t) {
+      var f = t.getHandlerFunction();
+      if (f === 'weeklyJob' || f === 'syncAll') ScriptApp.deleteTrigger(t);
+    });
+    ScriptApp.newTrigger('syncAll').timeBased().everyHours(3).create();
+  } catch (e) { /* 트리거 권한이 없으면 메뉴의 [자동 동기화 설치]로 */ }
+  props.setProperty('schema', 'v2');
 }
 
 // ───────────────────────── 유틸 ─────────────────────────
@@ -96,13 +119,13 @@ function installTriggers() {
 function sheet(name, headers) {
   var ss = SpreadsheetApp.getActive();
   var sh = ss.getSheetByName(name) || ss.insertSheet(name);
-  if (sh.getLastRow() === 0 && headers) sh.appendRow(headers);
+  if (sh.getLastRow() === 0 && headers) sh.getRange(1, 1, 1, headers.length).setValues([headers]);
   return sh;
 }
 
 function toast_(msg) { SpreadsheetApp.getActive().toast(msg); }
 
-// "20260711" 또는 Date → Date
+// "20260711" / "2026-07-11" / Date → Date
 function ymd_(v) {
   if (v instanceof Date) return v;
   var s = String(v).replace(/\D/g, '');
@@ -110,123 +133,10 @@ function ymd_(v) {
   return new Date(Number(s.slice(0, 4)), Number(s.slice(4, 6)) - 1, Number(s.slice(6, 8)));
 }
 
-// 대상 회차의 추첨일 = 마지막 추첨일 + 7일 × 회차 차이.
-// 로또·연금 모두 창설 이래 예외 없이 주 1회이므로(전 회차 간격 7일 검증됨) 정확하다.
-// "다음 토요일"식 계산은 추첨 직후(토 21:30 스케줄러) 실행 시 당일을 반환해 7일 어긋난다.
-function drawDateFor_(lastDate, lastEpsd, targetEpsd) {
-  var base = ymd_(lastDate);
-  if (!base) return nextDraw_(targetEpsd % 2 === 0 ? 6 : 6);  // 이력이 없을 때만 대체
-  var d = new Date(base.getTime());
-  d.setDate(d.getDate() + 7 * (Number(targetEpsd) - Number(lastEpsd)));
-  return d;
-}
-
-// 이력이 아예 없을 때만 쓰는 대체 계산 (dow: 0=일 … 6=토)
-function nextDraw_(dow) {
-  var d = new Date();
-  d.setHours(0, 0, 0, 0);
-  var delta = (dow - d.getDay() + 7) % 7;
-  return new Date(d.getTime() + (delta === 0 ? 7 : delta) * 864e5);
-}
-
-function getJson(url) {
-  var res;
-  try {
-    res = UrlFetchApp.fetch(url, FETCH_OPT);
-  } catch (e) {
-    throw new Error(
-      '동행복권 접속 실패("사용할 수 없는 주소"): 동행복권이 해외 IP를 차단하므로 ' +
-      'Apps Script에서는 직접 수집이 불가합니다. 파일 상단 MIRROR_* 상수의 미러 CSV를 사용하세요. ' +
-      '원인: ' + e.message);
-  }
-  if (res.getResponseCode() !== 200) throw new Error('HTTP ' + res.getResponseCode() + ' ' + url);
-  return JSON.parse(res.getContentText());
-}
-
-function getCsv_(url) {
-  var res = UrlFetchApp.fetch(url, FETCH_OPT);
-  if (res.getResponseCode() !== 200) {
-    throw new Error('미러 CSV 응답 HTTP ' + res.getResponseCode() + ' — 저장소가 공개 상태인지 확인: ' + url);
-  }
-  return Utilities.parseCsv(res.getContentText()).slice(1);
-}
-
-// ───────────────────────── 데이터 수집 ─────────────────────────
-
-function updateLotto() {
-  var sh = sheet(SH_LOTTO, ['회차', '추첨일', 'n1', 'n2', 'n3', 'n4', 'n5', 'n6', '보너스',
-                            '1등당첨자', '1등금액', '판매액']);
-  var last = sh.getLastRow() > 1 ? Number(sh.getRange(sh.getLastRow(), 1).getValue()) : 0;
-
-  if (MIRROR_LOTTO_CSV) {
-    var rows = getCsv_(MIRROR_LOTTO_CSV)
-      .filter(function (r) { return r.length >= 12 && Number(r[0]) > last; })
-      .map(function (r) { return [Number(r[0]), ymd_(r[1])].concat(r.slice(2, 12).map(Number)); })
-      .sort(function (a, b) { return a[0] - b[0]; });
-    if (rows.length) sh.getRange(sh.getLastRow() + 1, 1, rows.length, 12).setValues(rows);
-    toast_('로또 ' + rows.length + '회 추가 (미러 CSV)');
-    return;
-  }
-
-  var est = 1 + Math.floor((Date.now() - new Date(2002, 11, 7).getTime()) / (7 * 864e5));
-  var latest = 0;
-  for (var e = est + 1; e > est - 6 && !latest; e--) {
-    var probe = fetchLottoWindow_(e);
-    if (probe.length) latest = Math.max.apply(null, probe.map(function (r) { return r[0]; }));
-  }
-  if (!latest) throw new Error('로또 API 응답 없음 — dhlottery 개편 여부 확인');
-  if (latest <= last) { toast_('로또: 신규 회차 없음(' + last + '회)'); return; }
-
-  var buf = {};
-  for (var t = last + 1; t <= latest; t += 9) {
-    fetchLottoWindow_(Math.min(latest, t + 4)).forEach(function (r) { buf[r[0]] = r; });
-    Utilities.sleep(120);
-  }
-  for (var k = last + 1; k <= latest; k++) {
-    if (!buf[k]) fetchLottoWindow_(k).forEach(function (r) { buf[r[0]] = r; });
-  }
-  var out = [];
-  for (var i = last + 1; i <= latest; i++) if (buf[i]) out.push(buf[i]);
-  if (out.length) sh.getRange(sh.getLastRow() + 1, 1, out.length, out[0].length).setValues(out);
-  toast_('로또 ' + out.length + '회 추가 (최신 ' + latest + '회)');
-}
-
-function fetchLottoWindow_(epsd) {
-  var j = getJson(BASE + '/lt645/selectPstLt645InfoNew.do?srchDir=center&srchLtEpsd=' + epsd);
-  return (j.data && j.data.list || []).map(function (d) {
-    return [d.ltEpsd, ymd_(d.ltRflYmd), d.tm1WnNo, d.tm2WnNo, d.tm3WnNo, d.tm4WnNo, d.tm5WnNo,
-            d.tm6WnNo, d.bnsWnNo, d.rnk1WnNope, d.rnk1WnAmt, d.rlvtEpsdSumNtslAmt];
-  }).sort(function (a, b) { return a[0] - b[0]; });
-}
-
-function updatePension() {
-  var sh = sheet(SH_PENSION, ['회차', '추첨일', '조', '번호', '보너스']);
-  var last = sh.getLastRow() > 1 ? Number(sh.getRange(sh.getLastRow(), 1).getValue()) : 0;
-
-  if (MIRROR_PENSION_CSV) {
-    var rows = getCsv_(MIRROR_PENSION_CSV)
-      .filter(function (r) { return r.length >= 5 && Number(r[0]) > last; })
-      .map(function (r) { return [Number(r[0]), ymd_(r[1]), Number(r[2]), pad6_(r[3]), pad6_(r[4])]; })
-      .sort(function (a, b) { return a[0] - b[0]; });
-    if (rows.length) {
-      var at = sh.getLastRow() + 1;
-      sh.getRange(at, 1, rows.length, 5).setValues(rows);
-      sh.getRange(at, 4, rows.length, 2).setNumberFormat('@');  // 앞자리 0 보존
-    }
-    toast_('연금 ' + rows.length + '회 추가 (미러 CSV)');
-    return;
-  }
-  var j = getJson(BASE + '/pt720/selectPstPt720WnList.do');
-  var rows2 = j.data.result
-    .filter(function (d) { return d.psltEpsd > last; })
-    .sort(function (a, b) { return a.psltEpsd - b.psltEpsd; })
-    .map(function (d) { return [d.psltEpsd, ymd_(d.psltRflYmd), Number(d.wnBndNo), pad6_(d.wnRnkVl), pad6_(d.bnsRnkVl)]; });
-  if (rows2.length) {
-    var at2 = sh.getLastRow() + 1;
-    sh.getRange(at2, 1, rows2.length, 5).setValues(rows2);
-    sh.getRange(at2, 4, rows2.length, 2).setNumberFormat('@');
-  }
-  toast_('연금 ' + rows2.length + '회 추가');
+// "2026-09-30 22:11" → Date
+function ts_(v) {
+  var m = String(v).match(/(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})/);
+  return m ? new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5]) : v;
 }
 
 function pad6_(v) {
@@ -235,18 +145,431 @@ function pad6_(v) {
   return s;
 }
 
-// ───────────────────────── 통계 ─────────────────────────
-
-function readLotto_() {
-  var sh = SpreadsheetApp.getActive().getSheetByName(SH_LOTTO);
-  if (!sh || sh.getLastRow() < 2) throw new Error('먼저 [데이터 갱신]을 실행하세요');
-  return sh.getRange(2, 1, sh.getLastRow() - 1, 12).getValues();
+function comb_(n, k) {
+  if (k < 0 || k > n) return 0;
+  var r = 1;
+  for (var i = 0; i < k; i++) r = r * (n - i) / (i + 1);
+  return r;
 }
 
+function getCsv_(file) {
+  var res = UrlFetchApp.fetch(MIRROR + file, FETCH_OPT);
+  if (res.getResponseCode() === 404) return [];     // 아직 생성 전인 보조 파일
+  if (res.getResponseCode() !== 200) {
+    throw new Error('미러 CSV 응답 HTTP ' + res.getResponseCode() + ' — 저장소 공개 여부 확인: ' + MIRROR + file);
+  }
+  return Utilities.parseCsv(res.getContentText()).slice(1).filter(function (r) { return r.length > 1; });
+}
+
+function lastValue_(sh, col) {
+  return sh.getLastRow() > 1 ? Number(sh.getRange(sh.getLastRow(), col).getValue()) : 0;
+}
+
+function targetsIn_(sh, col) {
+  var have = {};
+  if (sh.getLastRow() > 1) {
+    sh.getRange(2, col, sh.getLastRow() - 1, 1).getValues().forEach(function (r) { have[Number(r[0])] = 1; });
+  }
+  return have;
+}
+
+function append_(sh, rows, width) {
+  if (!rows.length) return 0;
+  sh.getRange(sh.getLastRow() + 1, 1, rows.length, width).setValues(rows);
+  return rows.length;
+}
+
+// ───────────────────────── 데이터 (GitHub 미러) ─────────────────────────
+
+function updateLotto() {
+  var sh = sheet(SH.LOTTO, LOTTO_HEAD);
+  var last = lastValue_(sh, 1);
+  var rows = getCsv_('lotto_history.csv')
+    .filter(function (r) { return r.length >= 16 && Number(r[0]) > last; })
+    .map(function (r) { return [Number(r[0]), ymd_(r[1])].concat(r.slice(2, 16).map(Number)); })
+    .sort(function (a, b) { return a[0] - b[0]; });
+  return append_(sh, rows, LOTTO_HEAD.length);
+}
+
+function updatePension() {
+  var sh = sheet(SH.PENSION, PENSION_HEAD);
+  var last = lastValue_(sh, 1);
+  var rows = getCsv_('pension_history.csv')
+    .filter(function (r) { return r.length >= 5 && Number(r[0]) > last; })
+    .map(function (r) { return [Number(r[0]), ymd_(r[1]), Number(r[2]), pad6_(r[3]), pad6_(r[4])]; })
+    .sort(function (a, b) { return a[0] - b[0]; });
+  if (rows.length) sh.getRange(sh.getLastRow() + 1, 4, rows.length, 2).setNumberFormat('@');  // 앞자리 0 보존
+  return append_(sh, rows, PENSION_HEAD.length);
+}
+
+// 로컬 엔진 v2의 공식 추천을 가져온다 (회차당 1번 생성된 것 — 시트는 새로 뽑지 않는다)
+function importPicks_() {
+  var n = 0;
+  var sh = sheet(SH.PICK, LV2.head);
+  var have = targetsIn_(sh, LV2.target);
+  // created,target,draw_date,engine,strategy,set,n1..n6,split_mult
+  var rows = getCsv_('lotto_picks.csv')
+    .filter(function (r) { return r[3] === 'v2' && r[4] === '공식' && !have[Number(r[1])]; })
+    .map(function (r) {
+      return [ts_(r[0]), Number(r[1]), ymd_(r[2]), r[5]].concat(r.slice(6, 12).map(Number), [Number(r[12]), '', '']);
+    });
+  n += append_(sh, rows, LV2.head.length);
+
+  var psh = sheet(SH.PPICK, PL.head);
+  var phave = targetsIn_(psh, PL.target);
+  // created,target,draw_date,engine,rank,jo,num
+  var prows = getCsv_('pension_picks.csv')
+    .filter(function (r) { return r[3] === 'v2' && !phave[Number(r[1])]; })
+    .map(function (r) { return [ts_(r[0]), Number(r[1]), ymd_(r[2]), r[4] + '순위', Number(r[5]), pad6_(r[6]), '', '']; });
+  if (prows.length) psh.getRange(psh.getLastRow() + 1, PL.num, prows.length, 1).setNumberFormat('@');
+  n += append_(psh, prows, PL.head.length);
+  return n;
+}
+
+// 번호인기도 · 검증 시트 (로컬 엔진 산출물을 그대로 표시)
+function importAux_() {
+  var pop = getCsv_('popularity.csv');     // number,popularity,rank
+  if (pop.length) buildPopularity_(pop);
+  buildCheck_(getCsv_('backtest.csv'), getCsv_('scoreboard.csv'));
+}
+
+// ───────────────────────── 채점 ─────────────────────────
+
+function gradeAll_() {
+  var ss = SpreadsheetApp.getActive();
+  var lres = lottoResults_(), pres = pensionResults_();
+  [[SH.PICK, LV2], [SH.PICK_V1, LV1]].forEach(function (p) {
+    var sh = ss.getSheetByName(p[0]);
+    if (sh && sh.getLastRow() > 1) gradeLotto_(sh, p[1], lres);
+  });
+  [SH.PPICK, SH.PPICK_V1].forEach(function (name) {
+    var sh = ss.getSheetByName(name);
+    if (sh && sh.getLastRow() > 1) gradePension_(sh, pres);
+  });
+}
+
+function lottoResults_() {
+  var res = {}, sh = SpreadsheetApp.getActive().getSheetByName(SH.LOTTO);
+  if (!sh || sh.getLastRow() < 2) return res;
+  sh.getRange(2, 1, sh.getLastRow() - 1, 9).getValues().forEach(function (r) {
+    res[Number(r[0])] = { date: r[1], nums: r.slice(2, 8).map(Number), bonus: Number(r[8]) };
+  });
+  return res;
+}
+
+function pensionResults_() {
+  var res = {}, sh = SpreadsheetApp.getActive().getSheetByName(SH.PENSION);
+  if (!sh || sh.getLastRow() < 2) return res;
+  sh.getRange(2, 1, sh.getLastRow() - 1, 5).getValues().forEach(function (r) {
+    res[Number(r[0])] = { date: r[1], jo: Number(r[2]), num: pad6_(r[3]), bonus: pad6_(r[4]) };
+  });
+  return res;
+}
+
+function lottoRank_(m, bonusHit) {
+  return m === 6 ? '1등' : (m === 5 && bonusHit) ? '2등' : m === 5 ? '3등'
+       : m === 4 ? '4등' : m === 3 ? '5등' : '낙첨';
+}
+
+function gradeLotto_(sh, L, res) {
+  var n = sh.getLastRow() - 1;
+  var vals = sh.getRange(2, 1, n, L.head.length).getValues();
+  var numRange = sh.getRange(2, L.n1, n, 6);
+  var bgs = numRange.getBackgrounds(), fgs = numRange.getFontColors();
+  var hits = [], ranks = [], dates = [];
+  for (var i = 0; i < n; i++) {
+    var r = res[Number(vals[i][L.target - 1])];
+    if (!r) {
+      hits.push([vals[i][L.hit - 1] || '대기']);
+      ranks.push([vals[i][L.rank - 1] || '추첨 전']);
+      dates.push([vals[i][L.date - 1]]);
+      continue;
+    }
+    var m = 0, bonusHit = false;
+    for (var c = 0; c < 6; c++) {
+      var num = Number(vals[i][L.n1 - 1 + c]);
+      if (r.nums.indexOf(num) >= 0) { m++; bgs[i][c] = C_HIT_BG; fgs[i][c] = C_HIT_FG; }
+      else if (num === r.bonus) { bonusHit = true; bgs[i][c] = C_BONUS_BG; fgs[i][c] = C_BONUS_FG; }
+      else { bgs[i][c] = '#ffffff'; fgs[i][c] = '#000000'; }
+    }
+    hits.push([m + '개' + (bonusHit ? '+보너스' : '')]);
+    ranks.push([lottoRank_(m, bonusHit)]);
+    dates.push([r.date]);
+  }
+  numRange.setBackgrounds(bgs).setFontColors(fgs);
+  sh.getRange(2, L.hit, n, 1).setValues(hits);
+  sh.getRange(2, L.rank, n, 1).setValues(ranks);
+  sh.getRange(2, L.date, n, 1).setValues(dates);
+}
+
+// 연금 등수: 끝에서부터 연속 일치한 자리수
+//   1등 조+6자리 / 2등 6자리 / 3등 뒤5 / 4등 뒤4 / 5등 뒤3 / 6등 뒤2 / 7등 뒤1
+function gradePension_(sh, res) {
+  var n = sh.getLastRow() - 1;
+  var vals = sh.getRange(2, 1, n, PL.head.length).getValues();
+  var hitStyle = SpreadsheetApp.newTextStyle().setForegroundColor(C_HIT_FG).setBold(true).build();
+  var plain = SpreadsheetApp.newTextStyle().setForegroundColor('#000000').setBold(false).build();
+  var rts = [], hits = [], ranks = [], dates = [];
+  for (var i = 0; i < n; i++) {
+    var num = pad6_(vals[i][PL.num - 1]);
+    var r = res[Number(vals[i][PL.target - 1])];
+    var rt = SpreadsheetApp.newRichTextValue().setText(num).setTextStyle(0, 6, plain);
+    if (!r) {
+      rts.push([rt.build()]);
+      hits.push([vals[i][PL.hit - 1] || '대기']);
+      ranks.push([vals[i][PL.rank - 1] || '추첨 전']);
+      dates.push([vals[i][PL.date - 1]]);
+      continue;
+    }
+    var m = 0;
+    while (m < 6 && num[5 - m] === r.num[5 - m]) m++;
+    var joHit = Number(vals[i][PL.jo - 1]) === r.jo;
+    var rank = (m === 6 && joHit) ? '1등' : m === 6 ? '2등' : m === 5 ? '3등' : m === 4 ? '4등'
+             : m === 3 ? '5등' : m === 2 ? '6등' : m === 1 ? '7등' : '낙첨';
+    if (num === r.bonus) rank += '(보너스 일치)';
+    if (m > 0) rt.setTextStyle(6 - m, 6, hitStyle);
+    rts.push([rt.build()]);
+    hits.push([m + '자리' + (joHit ? '+조일치' : '')]);
+    ranks.push([rank]);
+    dates.push([r.date]);
+  }
+  sh.getRange(2, PL.num, n, 1).setRichTextValues(rts);
+  sh.getRange(2, PL.hit, n, 1).setValues(hits);
+  sh.getRange(2, PL.rank, n, 1).setValues(ranks);
+  sh.getRange(2, PL.date, n, 1).setValues(dates);
+}
+
+// ───────────────────────── 성적 ─────────────────────────
+
+function lottoHits_(name, L) {
+  var sh = SpreadsheetApp.getActive().getSheetByName(name), out = [];
+  if (!sh || sh.getLastRow() < 2) return out;
+  sh.getRange(2, L.hit, sh.getLastRow() - 1, 1).getValues().forEach(function (r) {
+    var m = String(r[0]).match(/^(\d)개/);
+    if (m) out.push(Number(m[1]));
+  });
+  return out;
+}
+
+function pensionTails_(name) {
+  var sh = SpreadsheetApp.getActive().getSheetByName(name), out = [];
+  if (!sh || sh.getLastRow() < 2) return out;
+  sh.getRange(2, PL.hit, sh.getLastRow() - 1, 1).getValues().forEach(function (r) {
+    var m = String(r[0]).match(/^(\d)자리/);
+    if (m) out.push(Number(m[1]));
+  });
+  return out;
+}
+
+function buildScore_() {
+  var sh = sheet(SH.SCORE);
+  sh.clear();
+  var W = 13, rows = [];
+  var pad = function (r) { while (r.length < W) r.push(''); return r; };
+  var pk = [];
+  for (var k = 0; k <= 6; k++) pk.push(comb_(6, k) * comb_(39, 6 - k) / comb_(45, 6));
+
+  rows.push(pad(['로또 — 세트별 적중 개수 (실제 / 이론 기대)']));
+  rows.push(['구분', '채점 세트', '평균 적중', '이론 평균', '0개', '1개', '2개', '3개', '4개', '5개', '6개',
+             '당첨(3개↑)', '이론 기대']);
+  [['v2 현행', SH.PICK, LV2], ['v1 구엔진', SH.PICK_V1, LV1]].forEach(function (g) {
+    var h = lottoHits_(g[1], g[2]), n = h.length;
+    var dist = [0, 0, 0, 0, 0, 0, 0], sum = 0;
+    h.forEach(function (x) { dist[x]++; sum += x; });
+    rows.push([g[0], n, n ? Math.round(sum / n * 100) / 100 : '-', 0.8].concat(dist,
+              [dist[3] + dist[4] + dist[5] + dist[6], Math.round(n * (pk[3] + pk[4] + pk[5] + pk[6]) * 100) / 100]));
+    rows.push(['  └ 이론 기대', '', '', ''].concat(pk.map(function (p) { return Math.round(p * n * 10) / 10; }), ['', '']));
+  });
+  rows.push(pad(['']));
+  rows.push(pad(['연금 — 끝자리 일치 (후보 전체 기준, 실제 / 이론 기대)']));
+  rows.push(pad(['구분', '채점 후보', '평균 일치', '이론 평균', '낙첨', '7등', '6등', '5등', '4등', '3등', '2등↑',
+                 '7등↑', '이론 기대']));
+  var pt = [0.9, 0.09, 0.009, 0.0009, 0.00009, 0.000009, 0.000001];   // 끝 k자리 정확히 일치 확률
+  [['v2 현행', SH.PPICK], ['v1 구엔진', SH.PPICK_V1]].forEach(function (g) {
+    var t = pensionTails_(g[1]), n = t.length, d = [0, 0, 0, 0, 0, 0, 0], sum = 0;
+    t.forEach(function (x) { d[x]++; sum += x; });
+    rows.push([g[0], n, n ? Math.round(sum / n * 1000) / 1000 : '-', 0.111].concat(d.slice(0, 6), [d[6], n - d[0],
+              Math.round(n * 0.1 * 10) / 10]));
+    rows.push(['  └ 이론 기대', '', '', ''].concat(pt.map(function (p) { return Math.round(p * n * 10) / 10; }), ['', '']));
+  });
+  rows.push(pad(['']));
+  rows.push(pad(['※ 각 추첨은 독립시행이라 어떤 엔진도 적중 확률을 바꾸지 못한다. 실제가 이론 기대 근처면 정상.']));
+  rows.push(pad(['※ 연금 v1은 후보의 64%가 끝자리 4에 몰려, 그 주 끝자리가 4가 아니면 대부분 동시에 낙첨됐다.']));
+  sh.getRange(1, 1, rows.length, W).setValues(rows.map(pad));
+
+  [1, 9].forEach(function (r) { sh.getRange(r, 1, 1, W).setFontWeight('bold').setBackground(C_HEAD_BG).setFontColor(C_HEAD_FG); });
+  [2, 10].forEach(function (r) { sh.getRange(r, 1, 1, W).setFontWeight('bold').setBackground(C_SUB_BG); });
+  [4, 6, 12, 14].forEach(function (r) { sh.getRange(r, 1, 1, W).setFontColor(C_PENDING); });
+  sh.getRange(1, 2, rows.length, W - 1).setHorizontalAlignment('center');
+  sh.setColumnWidth(1, 130);
+}
+
+// ───────────────────────── 편중 감시 ─────────────────────────
+
+function pickedNumbers_(name, L) {
+  var sh = SpreadsheetApp.getActive().getSheetByName(name), out = [];
+  if (!sh || sh.getLastRow() < 2) return out;
+  sh.getRange(2, L.n1, sh.getLastRow() - 1, 6).getValues().forEach(function (r) {
+    r.forEach(function (v) { if (Number(v) >= 1 && Number(v) <= 45) out.push(Number(v)); });
+  });
+  return out;
+}
+
+function pensionTailDigits_(name) {
+  var sh = SpreadsheetApp.getActive().getSheetByName(name), out = [];
+  if (!sh || sh.getLastRow() < 2) return out;
+  sh.getRange(2, PL.num, sh.getLastRow() - 1, 1).getValues().forEach(function (r) {
+    out.push(Number(pad6_(r[0])[5]));
+  });
+  return out;
+}
+
+function buildBias_() {
+  var sh = sheet(SH.BIAS);
+  sh.clear();
+  sh.clearConditionalFormatRules();
+  var W = 11, rows = [], pad = function (r) { while (r.length < W) r.push(''); return r; };
+  var groups = [['v2 현행', pickedNumbers_(SH.PICK, LV2)], ['v1 구엔진', pickedNumbers_(SH.PICK_V1, LV1)]];
+
+  rows.push(pad(['① 로또 번호 구간 비중 (균등 = 1.00, 0.8 미만·1.2 초과면 편중)']));
+  rows.push(pad(['구분', '1~9', '10~19', '20~29', '30~39', '40~45', '최대편차', '표본(번호 수)']));
+  groups.forEach(function (g) {
+    var ns = g[1], n = ns.length, row = [g[0]], dev = 0;
+    RANGES.forEach(function (rg) {
+      var cnt = ns.filter(function (x) { return x >= rg[0] && x <= rg[1]; }).length;
+      var v = n ? Math.round(cnt / n / ((rg[1] - rg[0] + 1) / 45) * 100) / 100 : '';
+      if (n) dev = Math.max(dev, Math.abs(v - 1));
+      row.push(v);
+    });
+    rows.push(pad(row.concat([n ? Math.round(dev * 100) + '%' : '-', n])));
+  });
+
+  rows.push(pad(['']));
+  var gridStarts = [];
+  groups.forEach(function (g) {
+    rows.push(pad(['② 번호별 추천 빈도 — ' + g[0] + ' (균등 = 1.00)']));
+    rows.push(pad(['구간', '+0', '+1', '+2', '+3', '+4', '+5', '+6', '+7', '+8', '+9']));
+    var cnt = {}, n = g[1].length;
+    g[1].forEach(function (x) { cnt[x] = (cnt[x] || 0) + 1; });
+    gridStarts.push(rows.length + 1);
+    for (var d = 0; d < 5; d++) {
+      var row = [(d * 10) + '번대'];
+      for (var u = 0; u < 10; u++) {
+        var num = d * 10 + u;
+        row.push(num >= 1 && num <= 45 && n ? Math.round((cnt[num] || 0) / (n / 45) * 100) / 100 : '');
+      }
+      rows.push(row);
+    }
+    rows.push(pad(['']));
+  });
+
+  rows.push(pad(['③ 연금 후보 끝자리 분포 (균등 = 1.00) — 연금 등수는 끝자리부터 정해진다']));
+  rows.push(pad(['구분', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9']));
+  var tailStart = rows.length + 1;
+  [['v2 현행', pensionTailDigits_(SH.PPICK)], ['v1 구엔진', pensionTailDigits_(SH.PPICK_V1)]].forEach(function (g) {
+    var n = g[1].length, cnt = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    g[1].forEach(function (x) { cnt[x]++; });
+    rows.push([g[0]].concat(cnt.map(function (c) { return n ? Math.round(c / (n / 10) * 100) / 100 : ''; })));
+  });
+  sh.getRange(1, 1, rows.length, W).setValues(rows.map(pad));
+
+  // 색: 1.00 흰색, 낮으면 빨강, 높으면 주황
+  var ranges = [sh.getRange(3, 2, 2, 5), sh.getRange(tailStart, 2, 2, 10)];
+  gridStarts.forEach(function (s) { ranges.push(sh.getRange(s, 2, 5, 10)); });
+  sh.setConditionalFormatRules([SpreadsheetApp.newConditionalFormatRule()
+    .setGradientMinpointWithValue('#e67c73', SpreadsheetApp.InterpolationType.NUMBER, '0')
+    .setGradientMidpointWithValue('#ffffff', SpreadsheetApp.InterpolationType.NUMBER, '1')
+    .setGradientMaxpointWithValue('#f6b26b', SpreadsheetApp.InterpolationType.NUMBER, '2')
+    .setRanges(ranges).build()]);
+  sh.getRange(1, 1, rows.length, W).setHorizontalAlignment('center');
+  sh.getRange(1, 1, rows.length, 1).setHorizontalAlignment('left');
+  for (var i = 0; i < rows.length; i++) {
+    if (/^[①②③]/.test(String(rows[i][0]))) {
+      sh.getRange(i + 1, 1, 1, W).setFontWeight('bold').setBackground(C_HEAD_BG).setFontColor(C_HEAD_FG);
+    } else if (rows[i][0] === '구분' || rows[i][0] === '구간') {
+      sh.getRange(i + 1, 1, 1, W).setFontWeight('bold').setBackground(C_SUB_BG);
+    }
+  }
+  sh.setColumnWidth(1, 110);
+}
+
+// ───────────────────────── 번호인기도 · 검증 ─────────────────────────
+
+function buildPopularity_(pop) {
+  var sh = sheet(SH.POP);
+  sh.clear();
+  sh.clearConditionalFormatRules();
+  var W = 11, rows = [], pad = function (r) { while (r.length < W) r.push(''); return r; };
+  var v = {};
+  pop.forEach(function (r) { v[Number(r[0])] = Number(r[1]); });
+  rows.push(pad(['번호별 인기도 — 사람들이 얼마나 많이 고르는가 (평균 = 1.000, 빨강=인기·파랑=비인기)']));
+  rows.push(pad(['구간', '+0', '+1', '+2', '+3', '+4', '+5', '+6', '+7', '+8', '+9']));
+  for (var d = 0; d < 5; d++) {
+    var row = [(d * 10) + '번대'];
+    for (var u = 0; u < 10; u++) { var num = d * 10 + u; row.push(v[num] ? v[num] : ''); }
+    rows.push(row);
+  }
+  var sorted = Object.keys(v).map(Number).sort(function (a, b) { return v[b] - v[a]; });
+  rows.push(pad(['']));
+  rows.push(pad(['가장 많이 찍힘', sorted.slice(0, 8).join(', ')]));
+  rows.push(pad(['가장 덜 찍힘', sorted.slice(-8).reverse().join(', ')]));
+  rows.push(pad(['']));
+  rows.push(pad(['어떻게 구했나: 5등(3개 일치)은 회당 약 270만 명. 무작위 구매라면 기대 인원이 정확히 계산되므로,']));
+  rows.push(pad(['  실제가 기대보다 많았던 회차의 당첨번호 = 많이 찍힌 번호. 최근 10년치로 번호별 기여를 역산했다.']));
+  rows.push(pad(['  과거로 학습해 미래 200회를 예측한 상관 0.83 — 실재하는 효과다. 다만 차이는 ±3% 수준으로 작다.']));
+  rows.push(pad(['쓰는 곳: 추천 엔진이 인기 번호를 조금 덜 골라, 1등 당첨 시 나눠 가질 사람을 줄인다(당첨 확률은 동일).']));
+  sh.getRange(1, 1, rows.length, W).setValues(rows.map(pad));
+  sh.getRange(3, 2, 5, 10).setNumberFormat('0.000').setHorizontalAlignment('center');
+  sh.setConditionalFormatRules([SpreadsheetApp.newConditionalFormatRule()
+    .setGradientMinpointWithValue('#6fa8dc', SpreadsheetApp.InterpolationType.NUMBER, '0.98')
+    .setGradientMidpointWithValue('#ffffff', SpreadsheetApp.InterpolationType.NUMBER, '1')
+    .setGradientMaxpointWithValue('#e67c73', SpreadsheetApp.InterpolationType.NUMBER, '1.025')
+    .setRanges([sh.getRange(3, 2, 5, 10)]).build()]);
+  sh.getRange(1, 1, 1, W).setFontWeight('bold').setBackground(C_HEAD_BG).setFontColor(C_HEAD_FG);
+  sh.getRange(2, 1, 1, W).setFontWeight('bold').setBackground(C_SUB_BG);
+  sh.setColumnWidth(1, 110);
+}
+
+function buildCheck_(bt, sb) {
+  var sh = sheet(SH.CHECK);
+  sh.clear();
+  var W = 8, rows = [], pad = function (r) { while (r.length < W) r.push(''); return r; };
+  rows.push(pad(['① 워크포워드 백테스트 — 각 회차 직전까지의 데이터만으로 추천하고 실제 결과로 채점']));
+  rows.push(pad(['엔진', '회차', '평균 적중', '3개↑ 세트', '주당 5등↑ 확률', '분할배율', '구간 최대편차', '20번대 비중']));
+  // backtest.csv: engine,draws,sets,avg_hits,pct_prize,weekly_any_prize_mc,split_mult,range_dev,share_20s
+  bt.forEach(function (r) {
+    rows.push([r[0], Number(r[1]), Number(r[3]), Number(r[4]) + '%', Number(r[5]) + '%',
+               Number(r[6]), Number(r[7]) + '%', Number(r[8]) + 'x']);
+  });
+  rows.push(pad(['이론', '', 0.8, '2.38%', '(무작위) 11.3%', 1, '0%', '1.00x']));
+  rows.push(pad(['']));
+  rows.push(pad(['읽는 법']));
+  rows.push(pad(['· 평균 적중: 모든 엔진이 이론값 0.80 근처 — 적중 확률은 어떤 방법으로도 못 바꾼다.']));
+  rows.push(pad(['· 주당 5등↑: 5세트 중 1개라도 3개 이상 맞힐 확률(4만 회 모의추첨). 30개 번호 분산으로 v2가 가장 높다.']));
+  rows.push(pad(['· 분할배율: 1등 당첨 시 함께 당첨될 예상 인원(무작위=1). v1은 편중이 컸지만 효과가 거의 없었다.']));
+  rows.push(pad(['· 구간 최대편차·20번대 비중: v1은 20번대를 절반만 뽑았다(0.50x). v2는 구조적으로 편중이 불가능하다.']));
+  rows.push(pad(['']));
+  var sbStart = rows.length + 1;
+  rows.push(pad(['② 로컬 엔진 실전 기록 (대조군 = 같은 주 완전 무작위 5세트, 구매용 아님)']));
+  rows.push(pad(['게임', '구분', '회차', '장수', '평균 적중', '이론', '당첨(실제/이론)', '분포']));
+  // scoreboard.csv: game,group,draws,tickets,avg_hits,theory_avg,prize_count,theory_prize,detail
+  sb.forEach(function (r) {
+    rows.push([r[0], r[1], Number(r[2]), Number(r[3]), Number(r[4]), Number(r[5]), r[6] + ' / ' + r[7], r[8]]);
+  });
+  sh.getRange(1, 1, rows.length, W).setValues(rows.map(pad));
+  [1, sbStart].forEach(function (r) { sh.getRange(r, 1, 1, W).setFontWeight('bold').setBackground(C_HEAD_BG).setFontColor(C_HEAD_FG); });
+  [2, sbStart + 1].forEach(function (r) { sh.getRange(r, 1, 1, W).setFontWeight('bold').setBackground(C_SUB_BG); });
+  sh.getRange(2, 2, rows.length - 1, W - 1).setHorizontalAlignment('center');
+  sh.setColumnWidth(1, 110);
+}
+
+// ───────────────────────── 통계 ─────────────────────────
+
 function buildStats() {
-  var data = readLotto_();
-  var freq = {}, rfreq = {}, lastSeen = {};
-  var recentFrom = Math.max(0, data.length - 52);
+  var src = SpreadsheetApp.getActive().getSheetByName(SH.LOTTO);
+  if (!src || src.getLastRow() < 2) return;
+  var data = src.getRange(2, 1, src.getLastRow() - 1, 8).getValues();
+  var freq = {}, rfreq = {}, lastSeen = {}, recentFrom = Math.max(0, data.length - 52);
   data.forEach(function (r, idx) {
     for (var c = 2; c <= 7; c++) {
       var n = r[c];
@@ -256,378 +579,46 @@ function buildStats() {
     }
   });
   var latest = data[data.length - 1][0];
-  var sh = sheet(SH_STATS);
+  var sh = sheet(SH.STATS);
   sh.clear();
+  sh.clearConditionalFormatRules();
   sh.getRange(1, 1, 1, 4).setValues([['번호', '역대출현', '최근52회', '미출현회차']]);
   var rows = [];
   for (var n = 1; n <= 45; n++) rows.push([n, freq[n] || 0, rfreq[n] || 0, latest - (lastSeen[n] || 0)]);
   sh.getRange(2, 1, 45, 4).setValues(rows);
-
-  var sums = data.map(function (r) { return r[2] + r[3] + r[4] + r[5] + r[6] + r[7]; })
-                 .sort(function (a, b) { return a - b; });
-  sh.getRange(1, 6, 6, 2).setValues([
+  sh.getRange(1, 6, 3, 2).setValues([
     ['기준 회차', latest + '회'],
-    ['갱신 시각', Utilities.formatDate(new Date(), 'Asia/Seoul', 'yyyy-MM-dd HH:mm')],
-    ['합계 5% 하한', sums[Math.floor(sums.length * 0.05)]],
-    ['합계 95% 상한', sums[Math.floor(sums.length * 0.95)]],
-    ['평균 합계', Math.round(sums.reduce(function (a, b) { return a + b; }, 0) / sums.length)],
-    ['비고', '출현 빈도는 균등분포와 구별 불가 — 참고용']
+    ['갱신', Utilities.formatDate(new Date(), 'Asia/Seoul', 'yyyy-MM-dd HH:mm')],
+    ['비고', '출현 빈도는 균등분포와 구별 불가 — 참고용 (예측력 없음)']
   ]);
-  formatStats_(sh);
-}
-
-// ───────────────────────── 추천 생성 ─────────────────────────
-
-function features_(c) {
-  var s = c.slice().sort(function (a, b) { return a - b; });
-  var consec = 0, odd = 0, low = 0, le31 = 0, dec = {}, sum = 0;
-  for (var i = 0; i < 6; i++) {
-    sum += s[i];
-    if (s[i] % 2) odd++;
-    if (s[i] <= 22) low++;
-    if (s[i] <= 31) le31++;
-    dec[Math.floor((s[i] - 1) / 10)] = 1;
-    if (i && s[i] - s[i - 1] === 1) consec++;
-  }
-  return { sum: sum, odd: odd, low: low, le31: le31, consec: consec, decades: Object.keys(dec).length };
-}
-
-function buildPicks() { buildPicks_(false); }
-function buildPicksForce() { buildPicks_(true); }
-
-function buildPicks_(force) {
-  var data = readLotto_();
-  var latest = Number(data[data.length - 1][0]);
-  var target = latest + 1;
-
-  var sh = sheet(SH_PICK, PICK_HEAD);
-  if (!force && hasTarget_(sh, 2, target)) {
-    toast_(target + '회 추천이 이미 있습니다. 다시 만들려면 [추천 재생성]을 쓰세요.');
-  } else {
-    var lastDraw = data[data.length - 1].slice(2, 8);
-    var histKeys = {};
-    data.forEach(function (r) {
-      histKeys[r.slice(2, 8).sort(function (a, b) { return a - b; }).join(',')] = 1;
-    });
-    var sums = data.map(function (r) { return r[2] + r[3] + r[4] + r[5] + r[6] + r[7]; })
-                   .sort(function (a, b) { return a - b; });
-    var lo = sums[Math.floor(sums.length * 0.05)], hi = sums[Math.floor(sums.length * 0.95)];
-
-    var cands = [], guard = 0;
-    while (cands.length < 4000 && guard++ < 200000) {
-      var pool = [];
-      for (var n = 1; n <= 45; n++) pool.push(n);
-      var c = [];
-      for (var k = 0; k < 6; k++) c.push(pool.splice(Math.floor(Math.random() * pool.length), 1)[0]);
-      c.sort(function (a, b) { return a - b; });
-      var f = features_(c);
-      if (f.sum < lo || f.sum > hi) continue;
-      if (f.odd < 2 || f.odd > 4) continue;
-      if (f.low < 2 || f.low > 4) continue;
-      if (f.consec > 1) continue;
-      if (f.decades < 3) continue;
-      if (f.le31 === 6) continue;                 // 전원 생일범위 → 분할 위험
-      if (histKeys[c.join(',')]) continue;        // 역대 1등 조합 배제
-      if (c.filter(function (x) { return lastDraw.indexOf(x) >= 0; }).length >= 4) continue;
-      var pop = 0.039 * f.le31 - 0.019 * f.consec + 0.011 * f.odd + 0.010 * f.decades;
-      cands.push({ c: c, f: f, pop: pop });
-    }
-    cands.sort(function (a, b) { return a.pop - b.pop; });
-    var top = cands.slice(0, Math.max(200, Math.floor(cands.length / 10)));
-    for (var i2 = top.length - 1; i2 > 0; i2--) {
-      var j2 = Math.floor(Math.random() * (i2 + 1));
-      var tmp = top[i2]; top[i2] = top[j2]; top[j2] = tmp;
-    }
-    var picked = [];
-    for (var t = 0; t < top.length && picked.length < 5; t++) {
-      var ok = picked.every(function (p) {
-        return top[t].c.filter(function (x) { return p.c.indexOf(x) >= 0; }).length <= 2;
-      });
-      if (ok) picked.push(top[t]);
-    }
-
-    var lastRow = data[data.length - 1];
-    var now = new Date(), drawDate = drawDateFor_(lastRow[1], lastRow[0], target);
-    var out = picked.map(function (p, idx) {
-      return [now, target, drawDate, String.fromCharCode(65 + idx)]
-        .concat(p.c, [p.f.sum, p.f.odd, Math.round(p.pop * 100) / 100, '', '']);
-    });
-    sh.getRange(sh.getLastRow() + 1, 1, out.length, PICK_HEAD.length).setValues(out);
-  }
-
-  buildPensionPicks_(force);
-  gradeResults();
-  beautifyAll();
-  toast_('추천 생성 완료 (로또 ' + target + '회)');
-}
-
-// 연금복권 추천 — 품절 대비 순위 리스트 PENSION_N건
-// 조·번호 조합은 전국에 1장뿐이라 이미 팔린 것은 살 수 없다. 앞 순위 품절 시 다음 순위로 구매.
-// 조는 1~5조에 라운드로빈으로 고르게 배정 — 한 조가 통째로 매진돼도 대안이 남는다.
-// (실제 당첨 확률은 모든 조합이 동일 — 자리별 가중치는 재미 요소)
-function buildPensionPicks_(force) {
-  var pSh = SpreadsheetApp.getActive().getSheetByName(SH_PENSION);
-  if (!pSh || pSh.getLastRow() < 2) return;
-  var pLatest = Number(pSh.getRange(pSh.getLastRow(), 1).getValue());
-  var target = pLatest + 1;
-  var sh = sheet(SH_PPICK, PPICK_HEAD);
-  if (!force && hasTarget_(sh, 2, target)) return;
-
-  var pData = pSh.getRange(2, 4, pSh.getLastRow() - 1, 1).getValues();  // 번호
-  var posCnt = [];
-  for (var d = 0; d < 6; d++) posCnt.push([0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
-  pData.forEach(function (r) {
-    var s = pad6_(r[0]);
-    for (var d2 = 0; d2 < 6; d2++) posCnt[d2][Number(s[d2])]++;
-  });
-  var posW = posCnt.map(function (cnt) {
-    var mean = cnt.reduce(function (a, b) { return a + b; }, 0) / 10;
-    return cnt.map(function (x) { return Math.max(1, 2 * mean - x); });
-  });
-  var wPick = function (w) {
-    var tot = w.reduce(function (a, b) { return a + b; }, 0), r = Math.random() * tot;
-    for (var i = 0; i < w.length; i++) { r -= w[i]; if (r <= 0) return i; }
-    return w.length - 1;
-  };
-
-  // 번호(6자리)만 점수순으로 뽑고, 조는 뒤에서 균등 배정한다
-  var seen = {}, list = [];
-  for (var g = 0; g < Math.max(2000, PENSION_N * 100); g++) {
-    var digits = [], score = 0;
-    for (var d3 = 0; d3 < 6; d3++) { var dg = wPick(posW[d3]); digits.push(dg); score += posW[d3][dg]; }
-    var key = digits.join('');
-    if (seen[key]) continue;
-    seen[key] = 1;
-    list.push({ num: key, score: score });
-  }
-  list.sort(function (x, y) { return y.score - x.score; });
-
-  var picked = [];
-  list.forEach(function (cand) {   // 후보 간 자리 일치 ≤3
-    if (picked.length >= PENSION_N) return;
-    var tooClose = picked.some(function (q) {
-      var same = 0;
-      for (var i = 0; i < 6; i++) if (q.num[i] === cand.num[i]) same++;
-      return same > 3;
-    });
-    if (!tooClose) picked.push(cand);
-  });
-  list.forEach(function (cand) {   // 모자라면 제약 완화해 채움
-    if (picked.length < PENSION_N && picked.indexOf(cand) < 0) picked.push(cand);
-  });
-
-  // 조 라운드로빈 배정 (5개 단위로 1~5조 한 번씩, 순서는 매회 섞어 편향 방지)
-  var jos = [];
-  while (jos.length < picked.length) {
-    var bag = [1, 2, 3, 4, 5];
-    for (var b = bag.length - 1; b > 0; b--) {
-      var s = Math.floor(Math.random() * (b + 1)), tp = bag[b]; bag[b] = bag[s]; bag[s] = tp;
-    }
-    jos = jos.concat(bag);
-  }
-
-  var lastDate = pSh.getRange(pSh.getLastRow(), 2).getValue();
-  var now = new Date(), drawDate = drawDateFor_(lastDate, pLatest, target);
-  var out = picked.map(function (p, i) {
-    return [now, target, drawDate, (i + 1) + '순위', jos[i], p.num, '', ''];
-  });
-  var at = sh.getLastRow() + 1;
-  sh.getRange(at, 1, out.length, PPICK_HEAD.length).setValues(out);
-  sh.getRange(at, PPICK_NUM, out.length, 1).setNumberFormat('@');
-}
-
-function hasTarget_(sh, col, target) {
-  if (sh.getLastRow() < 2) return false;
-  var vals = sh.getRange(2, col, sh.getLastRow() - 1, 1).getValues();
-  return vals.some(function (r) { return Number(r[0]) === target; });
-}
-
-// ───────────────────────── 결과 채점 ─────────────────────────
-
-function gradeResults() {
-  var a = gradeLotto_(), b = gradePension_();
-  buildScore_();
-  toast_('채점 완료 — 로또 ' + a + '건 / 연금 ' + b + '건');
-}
-
-function gradeLotto_() {
-  var ss = SpreadsheetApp.getActive();
-  var sh = ss.getSheetByName(SH_PICK), hSh = ss.getSheetByName(SH_LOTTO);
-  if (!sh || sh.getLastRow() < 2 || !hSh || hSh.getLastRow() < 2) return 0;
-
-  var res = {};
-  hSh.getRange(2, 1, hSh.getLastRow() - 1, 9).getValues().forEach(function (r) {
-    res[Number(r[0])] = { date: r[1], nums: r.slice(2, 8).map(Number), bonus: Number(r[8]) };
-  });
-
-  var n = sh.getLastRow() - 1;
-  var vals = sh.getRange(2, 1, n, PICK_HEAD.length).getValues();
-  var bgs = sh.getRange(2, PICK_N1, n, 6).getBackgrounds();
-  var fgs = sh.getRange(2, PICK_N1, n, 6).getFontColors();
-  var hits = [], ranks = [], dates = [], graded = 0;
-
-  for (var i = 0; i < n; i++) {
-    var target = Number(vals[i][1]);
-    var r = res[target];
-    if (!r) {                       // 아직 추첨 전
-      hits.push([vals[i][PICK_HIT - 1] || '대기']);
-      ranks.push([vals[i][PICK_RANK - 1] || '추첨 전']);
-      dates.push([vals[i][2]]);
-      continue;
-    }
-    var m = 0, bonusHit = false;
-    for (var c = 0; c < 6; c++) {
-      var num = Number(vals[i][PICK_N1 - 1 + c]);
-      if (r.nums.indexOf(num) >= 0) {
-        m++; bgs[i][c] = C_HIT_BG; fgs[i][c] = C_HIT_FG;
-      } else if (num === r.bonus) {
-        bonusHit = true; bgs[i][c] = C_BONUS_BG; fgs[i][c] = C_BONUS_FG;
-      } else {
-        bgs[i][c] = C_MISS_BG; fgs[i][c] = '#000000';
-      }
-    }
-    var rank = m === 6 ? '1등' : (m === 5 && bonusHit) ? '2등' : m === 5 ? '3등'
-             : m === 4 ? '4등' : m === 3 ? '5등' : '낙첨';
-    hits.push([m + '개' + (bonusHit ? '+보너스' : '')]);
-    ranks.push([rank]);
-    dates.push([r.date]);
-    graded++;
-  }
-  sh.getRange(2, PICK_N1, n, 6).setBackgrounds(bgs).setFontColors(fgs);
-  sh.getRange(2, PICK_HIT, n, 1).setValues(hits);
-  sh.getRange(2, PICK_RANK, n, 1).setValues(ranks);
-  sh.getRange(2, 3, n, 1).setValues(dates);
-  return graded;
-}
-
-// 연금복권 등수: 뒤에서부터 연속 일치한 자리수로 결정
-//   1등 = 조+6자리 전부 / 2등 = 조 무관 6자리 / 3등 뒤5 / 4등 뒤4 / 5등 뒤3 / 6등 뒤2 / 7등 뒤1
-function gradePension_() {
-  var ss = SpreadsheetApp.getActive();
-  var sh = ss.getSheetByName(SH_PPICK), hSh = ss.getSheetByName(SH_PENSION);
-  if (!sh || sh.getLastRow() < 2 || !hSh || hSh.getLastRow() < 2) return 0;
-
-  var res = {};
-  hSh.getRange(2, 1, hSh.getLastRow() - 1, 5).getValues().forEach(function (r) {
-    res[Number(r[0])] = { date: r[1], jo: Number(r[2]), num: pad6_(r[3]), bonus: pad6_(r[4]) };
-  });
-
-  var n = sh.getLastRow() - 1;
-  var vals = sh.getRange(2, 1, n, PPICK_HEAD.length).getValues();
-  var rts = [], hits = [], ranks = [], dates = [], graded = 0;
-  var hitStyle = SpreadsheetApp.newTextStyle().setForegroundColor(C_HIT_FG).setBold(true).build();
-  var missStyle = SpreadsheetApp.newTextStyle().setForegroundColor('#000000').setBold(false).build();
-
-  for (var i = 0; i < n; i++) {
-    var target = Number(vals[i][1]);
-    var num = pad6_(vals[i][PPICK_NUM - 1]);
-    var r = res[target];
-    if (!r) {
-      rts.push([SpreadsheetApp.newRichTextValue().setText(num)
-                 .setTextStyle(0, 6, missStyle).build()]);
-      hits.push([vals[i][PPICK_HIT - 1] || '대기']);
-      ranks.push([vals[i][PPICK_RANK - 1] || '추첨 전']);
-      dates.push([vals[i][2]]);
-      continue;
-    }
-    var m = 0;
-    while (m < 6 && num[5 - m] === r.num[5 - m]) m++;
-    var joHit = Number(vals[i][4]) === r.jo;
-    var rank = (m === 6 && joHit) ? '1등' : m === 6 ? '2등' : m === 5 ? '3등' : m === 4 ? '4등'
-             : m === 3 ? '5등' : m === 2 ? '6등' : m === 1 ? '7등' : '낙첨';
-    if (num === r.bonus) rank += '(보너스 일치)';
-    var rt = SpreadsheetApp.newRichTextValue().setText(num).setTextStyle(0, 6, missStyle);
-    if (m > 0) rt.setTextStyle(6 - m, 6, hitStyle);
-    rts.push([rt.build()]);
-    hits.push([m + '자리' + (joHit ? '+조일치' : '')]);
-    ranks.push([rank]);
-    dates.push([r.date]);
-    graded++;
-  }
-  sh.getRange(2, PPICK_NUM, n, 1).setRichTextValues(rts);
-  sh.getRange(2, PPICK_HIT, n, 1).setValues(hits);
-  sh.getRange(2, PPICK_RANK, n, 1).setValues(ranks);
-  sh.getRange(2, 3, n, 1).setValues(dates);
-  return graded;
-}
-
-// ───────────────────────── 성적표 ─────────────────────────
-
-function comb_(n, k) {
-  if (k < 0 || k > n) return 0;
-  var r = 1;
-  for (var i = 0; i < k; i++) r = r * (n - i) / (i + 1);
-  return r;
-}
-
-function buildScore_() {
-  var ss = SpreadsheetApp.getActive();
-  var sh = sheet(SH_SCORE);
-  var pk = ss.getSheetByName(SH_PICK);
-  sh.clear();
-
-  var rows = [['로또 추천 성적 (채점 완료분만)', '']];
-  var total = 0, sumHit = 0, dist = [0, 0, 0, 0, 0, 0, 0], rankCnt = {};
-  if (pk && pk.getLastRow() > 1) {
-    pk.getRange(2, PICK_HIT, pk.getLastRow() - 1, 2).getValues().forEach(function (r) {
-      var mm = String(r[0]).match(/^(\d)개/);
-      if (!mm) return;
-      total++; var k = Number(mm[1]); dist[k]++; sumHit += k;
-      rankCnt[r[1]] = (rankCnt[r[1]] || 0) + 1;
-    });
-  }
-  rows.push(['채점한 세트 수', total]);
-  rows.push(['평균 적중 개수', total ? Math.round(sumHit / total * 100) / 100 : 0]);
-  rows.push(['이론 기대 적중', 0.8]);
-  rows.push(['', '']);
-  rows.push(['맞은 개수', '실제 건수', '이론 기대 건수']);
-  for (var k = 0; k <= 6; k++) {
-    var p = comb_(6, k) * comb_(39, 6 - k) / comb_(45, 6);
-    rows.push([k + '개', dist[k], Math.round(p * total * 100) / 100]);
-  }
-  rows.push(['', '']);
-  rows.push(['등수', '건수', '']);
-  ['1등', '2등', '3등', '4등', '5등', '낙첨'].forEach(function (rk) {
-    rows.push([rk, rankCnt[rk] || 0, '']);
-  });
-
-  var ppk = ss.getSheetByName(SH_PPICK);
-  rows.push(['', '']);
-  rows.push(['연금복권 성적 (채점 완료분만)', '']);
-  var pTotal = 0, pRank = {};
-  if (ppk && ppk.getLastRow() > 1) {
-    ppk.getRange(2, PPICK_HIT, ppk.getLastRow() - 1, 2).getValues().forEach(function (r) {
-      if (!/^\d자리/.test(String(r[0]))) return;
-      pTotal++;
-      var rk = String(r[1]).replace('(보너스 일치)', '');
-      pRank[rk] = (pRank[rk] || 0) + 1;
-    });
-  }
-  rows.push(['채점한 후보 수', pTotal]);
-  ['1등', '2등', '3등', '4등', '5등', '6등', '7등', '낙첨'].forEach(function (rk) {
-    rows.push([rk, pRank[rk] || 0, '']);
-  });
-  rows.push(['', '']);
-  rows.push(['※ 각 추첨은 독립시행 — 성적이 좋아도 다음 회차 확률은 변하지 않는다.', '']);
-
-  var width = 3;
-  var padded = rows.map(function (r) { while (r.length < width) r.push(''); return r.slice(0, width); });
-  sh.getRange(1, 1, padded.length, width).setValues(padded);
-  sh.getRange(1, 1, 1, width).setFontWeight('bold').setBackground(C_HEAD_BG).setFontColor(C_HEAD_FG);
-  sh.getRange(6, 1, 1, width).setFontWeight('bold').setBackground('#e8eef7');
-  sh.setColumnWidth(1, 220); sh.setColumnWidth(2, 110); sh.setColumnWidth(3, 130);
+  headerStyle_(sh, 4);
+  sh.getRange(2, 1, 45, 4).setHorizontalAlignment('center');
+  sh.getRange(1, 6, 3, 1).setFontWeight('bold');
+  sh.setConditionalFormatRules([2, 4].map(function (col) {
+    return SpreadsheetApp.newConditionalFormatRule()
+      .setGradientMinpointWithValue('#ffffff', SpreadsheetApp.InterpolationType.MIN, '')
+      .setGradientMaxpointWithValue(col === 2 ? '#4a86c8' : '#f6b26b', SpreadsheetApp.InterpolationType.MAX, '')
+      .setRanges([sh.getRange(2, col, 45, 1)]).build();
+  }));
 }
 
 // ───────────────────────── 서식 ─────────────────────────
 
 function beautifyAll() {
   var ss = SpreadsheetApp.getActive();
-  if (ss.getSheetByName(SH_LOTTO)) formatHistory_(ss.getSheetByName(SH_LOTTO), 12, 2, 1);
-  if (ss.getSheetByName(SH_PENSION)) formatHistory_(ss.getSheetByName(SH_PENSION), 5, 2, 1);
-  if (ss.getSheetByName(SH_STATS)) formatStats_(ss.getSheetByName(SH_STATS));
-  if (ss.getSheetByName(SH_PICK)) formatPicks_(ss.getSheetByName(SH_PICK), PICK_HEAD.length, 2, 3);
-  if (ss.getSheetByName(SH_PPICK)) formatPicks_(ss.getSheetByName(SH_PPICK), PPICK_HEAD.length, 2, 3);
-  toast_('서식 적용 완료');
+  var g = function (n) { return ss.getSheetByName(n); };
+  if (g(SH.LOTTO)) formatHistory_(g(SH.LOTTO), LOTTO_HEAD.length, true);
+  if (g(SH.PENSION)) formatHistory_(g(SH.PENSION), PENSION_HEAD.length, false);
+  if (g(SH.PICK)) formatPicks_(g(SH.PICK), LV2, 6);
+  if (g(SH.PICK_V1)) formatPicks_(g(SH.PICK_V1), LV1, 6);
+  if (g(SH.PPICK)) formatPicks_(g(SH.PPICK), PL, 1);
+  if (g(SH.PPICK_V1)) formatPicks_(g(SH.PPICK_V1), PL, 1);
+  var pos = 1;
+  TAB_ORDER.forEach(function (name) {
+    var sh = g(name);
+    if (sh) { ss.setActiveSheet(sh); ss.moveActiveSheet(pos++); }
+  });
+  if (g(SH.PICK)) ss.setActiveSheet(g(SH.PICK));
 }
 
 function headerStyle_(sh, nCols) {
@@ -638,107 +629,66 @@ function headerStyle_(sh, nCols) {
   sh.setFrozenRows(1);
 }
 
-// 이력 시트: 날짜 서식 + 연도 경계 구분선 + 숫자 천단위
-function formatHistory_(sh, nCols, dateCol, epsdCol) {
+// 이력: 날짜 서식 + 연도 경계 굵은 선 + 금액·인원 천단위
+function formatHistory_(sh, nCols, isLotto) {
   var n = sh.getLastRow() - 1;
   if (n < 1) return;
   headerStyle_(sh, nCols);
-  sh.getRange(2, dateCol, n, 1).setNumberFormat('yyyy-mm-dd(ddd)').setHorizontalAlignment('center');
-  sh.getRange(2, epsdCol, n, 1).setHorizontalAlignment('center');
-  sh.getRange(2, 1, n, nCols).setFontFamily('Roboto Mono').setFontSize(10);
-  if (nCols >= 12) {   // 로또: 금액 열 천단위
-    sh.getRange(2, 10, n, 3).setNumberFormat('#,##0');
-    sh.getRange(2, 3, n, 7).setHorizontalAlignment('center');
-  } else {             // 연금: 조·번호 가운데
-    sh.getRange(2, 3, n, 3).setHorizontalAlignment('center');
-  }
-  // 연도가 바뀌는 행 위에 굵은 구분선 (날짜 구간을 눈으로 나눠 보기 위함)
-  sh.getRange(2, 1, n, nCols).setBorder(null, null, null, null, false, false);
-  var dates = sh.getRange(2, dateCol, n, 1).getValues();
-  var prevYear = null;
+  sh.getRange(2, 1, n, nCols).setFontFamily('Roboto Mono').setFontSize(10).setHorizontalAlignment('center')
+    .setBorder(null, null, null, null, false, false);
+  sh.getRange(2, 2, n, 1).setNumberFormat('yyyy-mm-dd(ddd)');
+  if (isLotto) sh.getRange(2, 10, n, 7).setNumberFormat('#,##0');
+  var dates = sh.getRange(2, 2, n, 1).getValues(), prev = null;
   for (var i = 0; i < n; i++) {
     var d = dates[i][0];
     if (!(d instanceof Date)) continue;
-    var y = d.getFullYear();
-    if (prevYear !== null && y !== prevYear) {
-      sh.getRange(i + 2, 1, 1, nCols)
-        .setBorder(true, null, null, null, null, null, '#1f3864', SpreadsheetApp.BorderStyle.SOLID_MEDIUM);
+    if (prev !== null && d.getFullYear() !== prev) {
+      sh.getRange(i + 2, 1, 1, nCols).setBorder(true, null, null, null, null, null,
+        C_HEAD_BG, SpreadsheetApp.BorderStyle.SOLID_MEDIUM);
     }
-    prevYear = y;
+    prev = d.getFullYear();
   }
   sh.autoResizeColumns(1, nCols);
 }
 
-function formatStats_(sh) {
-  headerStyle_(sh, 4);
-  sh.getRange(2, 1, 45, 4).setHorizontalAlignment('center').setFontFamily('Roboto Mono');
-  sh.getRange(1, 6, 6, 1).setFontWeight('bold');
-  sh.setColumnWidth(5, 24); sh.setColumnWidth(6, 150); sh.setColumnWidth(7, 220);
-  // 출현 빈도 색조 (많을수록 진하게)
-  sh.getRange(2, 2, 45, 1).clearFormat();
-  var rules = sh.getConditionalFormatRules().filter(function (r) {
-    return r.getRanges().every(function (rg) { return rg.getSheet().getName() !== sh.getName(); });
-  });
-  rules.push(SpreadsheetApp.newConditionalFormatRule()
-    .setGradientMinpointWithValue('#ffffff', SpreadsheetApp.InterpolationType.MIN, '')
-    .setGradientMaxpointWithValue('#4a86c8', SpreadsheetApp.InterpolationType.MAX, '')
-    .setRanges([sh.getRange(2, 2, 45, 1)]).build());
-  rules.push(SpreadsheetApp.newConditionalFormatRule()
-    .setGradientMinpointWithValue('#ffffff', SpreadsheetApp.InterpolationType.MIN, '')
-    .setGradientMaxpointWithValue('#f6b26b', SpreadsheetApp.InterpolationType.MAX, '')
-    .setRanges([sh.getRange(2, 4, 45, 1)]).build());
-  sh.setConditionalFormatRules(rules);
-  sh.getRange(2, 2, 45, 1).setNumberFormat('0');
-}
-
-// 추천 시트: 회차 그룹마다 배경 교대 + 경계 구분선, 등수 강조
-function formatPicks_(sh, nCols, groupCol, dateCol) {
-  var n = sh.getLastRow() - 1;
+// 추천: 회차 그룹마다 배경 교대 + 경계선, 등수 강조. 번호 열 배경은 채점 색이라 건드리지 않는다.
+function formatPicks_(sh, L, numCount) {
+  var n = sh.getLastRow() - 1, W = L.head.length;
   if (n < 1) return;
-  headerStyle_(sh, nCols);
-  var vals = sh.getRange(2, 1, n, nCols).getValues();
-  sh.getRange(2, 1, n, 1).setNumberFormat('yyyy-mm-dd HH:mm');
-  sh.getRange(2, dateCol, n, 1).setNumberFormat('yyyy-mm-dd(ddd)');
-  sh.getRange(2, 1, n, nCols).setFontFamily('Roboto Mono').setFontSize(10)
-    .setHorizontalAlignment('center').setVerticalAlignment('middle');
-  sh.getRange(2, 1, n, 1).setHorizontalAlignment('left');
+  headerStyle_(sh, W);
+  var numStart = L.n1 || L.num;
+  var all = sh.getRange(2, 1, n, W);
+  all.setFontFamily('Roboto Mono').setFontSize(10).setHorizontalAlignment('center').setVerticalAlignment('middle')
+     .setBorder(null, null, null, null, false, false);
+  sh.getRange(2, 1, n, 1).setNumberFormat('yyyy-mm-dd HH:mm').setHorizontalAlignment('left');
+  sh.getRange(2, L.date, n, 1).setNumberFormat('yyyy-mm-dd(ddd)');
 
-  // 회차 그룹: 교대 배경(번호 열 제외 — 적중 색을 덮지 않도록) + 그룹 경계선
-  var isLotto = (nCols === PICK_HEAD.length);
-  var numStart = isLotto ? PICK_N1 : PPICK_NUM;
-  var numCount = isLotto ? 6 : 1;
-  var bgCols = [];
-  for (var c = 1; c <= nCols; c++) {
-    if (c >= numStart && c < numStart + numCount) continue;
-    bgCols.push(c);
-  }
-  var groupIdx = -1, prevKey = null;
+  var vals = all.getValues(), bgs = all.getBackgrounds(), prevKey = null, grp = -1;
   for (var i = 0; i < n; i++) {
-    var key = String(vals[i][groupCol - 1]);
+    var key = String(vals[i][L.target - 1]);
     if (key !== prevKey) {
-      groupIdx++;
-      if (i > 0) {
-        sh.getRange(i + 2, 1, 1, nCols).setBorder(
-          true, null, null, null, null, null, '#1f3864', SpreadsheetApp.BorderStyle.SOLID_MEDIUM);
-      }
+      grp++;
+      if (i > 0) sh.getRange(i + 2, 1, 1, W).setBorder(true, null, null, null, null, null,
+        C_HEAD_BG, SpreadsheetApp.BorderStyle.SOLID_MEDIUM);
       prevKey = key;
     }
-    var bg = (groupIdx % 2 === 0) ? C_GROUP_A : C_GROUP_B;
-    bgCols.forEach(function (c) { sh.getRange(i + 2, c).setBackground(bg); });
+    for (var c = 0; c < W; c++) {
+      if (c + 1 >= numStart && c + 1 < numStart + numCount) continue;
+      bgs[i][c] = grp % 2 === 0 ? C_GROUP_A : C_GROUP_B;
+    }
   }
+  all.setBackgrounds(bgs);
 
-  // 등수 열 강조 + 미추첨 회색
-  var rankCol = isLotto ? PICK_RANK : PPICK_RANK;
-  var ranks = sh.getRange(2, rankCol, n, 1).getValues();
-  var fg = [], fw = [];
-  for (var r2 = 0; r2 < n; r2++) {
-    var v = String(ranks[r2][0]);
-    var win = /^[1-7]등/.test(v);
+  var ranks = sh.getRange(2, L.rank, n, 1).getValues(), fg = [], fw = [];
+  ranks.forEach(function (r) {
+    var v = String(r[0]), win = /^[1-7]등/.test(v);
     fg.push([win ? C_HIT_FG : (v === '추첨 전' ? C_PENDING : '#000000')]);
     fw.push([win ? 'bold' : 'normal']);
-  }
-  sh.getRange(2, rankCol, n, 1).setFontColors(fg).setFontWeights(fw);
+  });
+  sh.getRange(2, L.rank, n, 1).setFontColors(fg).setFontWeights(fw);
   sh.getRange(2, numStart, n, numCount).setFontWeight('bold').setFontSize(11);
-  sh.autoResizeColumns(1, nCols);
+  if (L === PL) sh.getRange(2, PL.num, n, 1).setNumberFormat('@');
+  if (L === LV2) sh.getRange(2, 11, n, 1).setNumberFormat('0.00');
+  sh.autoResizeColumns(1, W);
   sh.setColumnWidth(1, 130);
 }
