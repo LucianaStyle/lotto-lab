@@ -11,6 +11,7 @@
 | `lotto_sheets.gs` | 구글 시트 대시보드 — 미러에서 가져와 표시·채점·편중 감시 (번호를 직접 만들지 않음) |
 | `tools/check_engine.py` | 불변 조건 검사 — **규칙을 바꾸면 반드시 실행** (편중 재발 시 실패) |
 | `tools/backtest.py` | 워크포워드 백테스트 v1/v2/무작위 → `data/backtest.csv` |
+| `tools/test_sheets.js` | 시트 스크립트 종단 테스트 — **`.gs`를 고치면 반드시 실행** (`node tools/test_sheets.js`) |
 | `data/lotto_history.csv` | 로또 전 회차 (번호, 1~5등 당첨자 수, 총판매액) |
 | `data/pension_history.csv` | 연금복권 720+ 전 회차 |
 | `data/lotto_picks.csv` / `pension_picks.csv` | 추천 기록부 (회차당 1회, v1 이력은 로그에서 복원) |
