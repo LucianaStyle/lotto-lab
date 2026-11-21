@@ -230,7 +230,20 @@ function importPicks_() {
 function importAux_() {
   var pop = getCsv_('popularity.csv');     // number,popularity,rank
   if (pop.length) buildPopularity_(pop);
-  buildCheck_(getCsv_('backtest.csv'), getCsv_('scoreboard.csv'));
+  SCOREBOARD_ = getCsv_('scoreboard.csv');
+  buildCheck_(getCsv_('backtest.csv'), SCOREBOARD_);
+}
+
+// importAux_가 읽은 scoreboard.csv를 성적 시트의 운 판정에서 다시 쓴다 (같은 동기화 안에서만 유효)
+var SCOREBOARD_ = [];
+var C_LUCK = { '운이 많이 나쁨': '#f4c7c3', '운이 조금 나쁜 편': '#fce8b2', '정상 범위': '#d9ead3',
+               '운이 조금 좋은 편': '#c9daf8', '운이 아주 좋음': '#a4c2f4' };
+
+// scoreboard.csv: ...,detail(8),luck_pct,luck,recent_draws,recent_hits,recent_expect,recent_pct,recent_luck
+function luckRows_(sb) {
+  return sb.filter(function (r) { return r[0] === '로또' && r.length >= 16 && r[10]; }).map(function (r) {
+    return [r[1], Number(r[9]), r[10], r[11] + '회', Number(r[12]) + '개 / ' + Number(r[13]), Number(r[14]), r[15]];
+  });
 }
 
 // ───────────────────────── 채점 ─────────────────────────
@@ -395,7 +408,27 @@ function buildScore_() {
   rows.push(pad(['']));
   rows.push(pad(['※ 각 추첨은 독립시행이라 어떤 엔진도 적중 확률을 바꾸지 못한다. 실제가 이론 기대 근처면 정상.']));
   rows.push(pad(['※ 연금 v1은 후보의 64%가 끝자리 4에 몰려, 그 주 끝자리가 4가 아니면 대부분 동시에 낙첨됐다.']));
+
+  var luck = luckRows_(SCOREBOARD_), luckStart = 0;
+  if (luck.length) {
+    rows.push(pad(['']));
+    luckStart = rows.length + 1;
+    rows.push(pad(['로또 운 판정 — 무작위로 샀다면 100번 중 몇 번이 이보다 덜 맞았을까 (50 = 딱 평균)']));
+    rows.push(pad(['구분', '전체 점수', '전체 판정', '최근', '적중 / 기대', '최근 점수', '최근 판정']));
+    luck.forEach(function (r) { rows.push(pad(r)); });
+    rows.push(pad(['※ 25~75 = 정상 범위. 5 미만이어도 엔진 고장이 아니라 운 — 대조군(완전 무작위)도 같은 폭으로 오르내린다.']));
+    rows.push(pad(['※ 연금은 10순위마다 끝자리 0~9를 모두 담아 7등 개수가 구조적으로 고정이라 판정하지 않는다.']));
+  }
   sh.getRange(1, 1, rows.length, W).setValues(rows.map(pad));
+  if (luckStart) {
+    sh.getRange(luckStart, 1, 1, W).setFontWeight('bold').setBackground(C_HEAD_BG).setFontColor(C_HEAD_FG);
+    sh.getRange(luckStart + 1, 1, 1, W).setFontWeight('bold').setBackground(C_SUB_BG);
+    luck.forEach(function (r, i) {
+      [[3, r[2]], [7, r[6]]].forEach(function (c) {
+        sh.getRange(luckStart + 2 + i, c[0], 1, 1).setBackgrounds([[C_LUCK[c[1]] || '#ffffff']]).setFontWeight('bold');
+      });
+    });
+  }
 
   [1, 9].forEach(function (r) { sh.getRange(r, 1, 1, W).setFontWeight('bold').setBackground(C_HEAD_BG).setFontColor(C_HEAD_FG); });
   [2, 10].forEach(function (r) { sh.getRange(r, 1, 1, W).setFontWeight('bold').setBackground(C_SUB_BG); });

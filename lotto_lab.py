@@ -452,22 +452,80 @@ def grade(lp: pd.DataFrame, pp: pd.DataFrame, lotto: pd.DataFrame, pension: pd.D
     return g, pg
 
 
+LUCK_RECENT = 4   # '요즘' 판정에 쓰는 최근 회차 수
+
+
+def draw_hits_pmf(tickets: list) -> np.ndarray:
+    """한 회차에 산 세트들의 '맞은 번호 개수 합계' 정확 분포 (무작위 추첨 기준).
+
+    번호 j가 m장에 들어 있으면 j가 당첨번호일 때 m개가 더해진다. 같은 배수의 번호끼리 묶어
+    6개를 어느 묶음에서 몇 개 뽑는지 세는 DP — 세트가 겹쳐도(v1) 정확하다.
+    """
+    mult = Counter(n for t in tickets for n in t)
+    classes = Counter(mult.values())
+    classes[0] = 45 - len(mult)
+    top = 6 * max(classes)
+    dp = np.zeros((7, top + 1))
+    dp[0, 0] = 1.0
+    for m, c in classes.items():
+        nxt = np.zeros_like(dp)
+        for k in range(7):
+            for h in np.nonzero(dp[k])[0]:
+                for j in range(0, min(c, 6 - k) + 1):
+                    nxt[k + j, h + m * j] += dp[k, h] * comb(c, j)
+        dp = nxt
+    return dp[6] / TOTAL_COMBOS
+
+
+def luck(d: pd.DataFrame) -> dict:
+    """실제 적중 합계가 무작위 분포에서 어디쯤인지 — 무작위로 샀다면 100번 중 몇 번이 이보다 덜 맞았나(mid-p)."""
+    pmf, obs = np.array([1.0]), 0
+    for _, t in d.groupby("target"):
+        pmf = np.convolve(pmf, draw_hits_pmf([tuple(int(v) for v in r) for r in t[NUM_COLS].to_numpy()]))
+        obs += int(t["hits"].sum())
+    pct = float(pmf[:obs].sum() + pmf[obs] / 2) * 100
+    return {"hits": obs, "expect": float((np.arange(len(pmf)) * pmf).sum()), "pct": pct, "label": luck_label(pct)}
+
+
+def luck_label(pct: float) -> str:
+    if pct < 5:
+        return "운이 많이 나쁨"
+    if pct < 25:
+        return "운이 조금 나쁜 편"
+    if pct <= 75:
+        return "정상 범위"
+    if pct <= 95:
+        return "운이 조금 좋은 편"
+    return "운이 아주 좋음"
+
+
 def scoreboard(g: pd.DataFrame, pg: pd.DataFrame) -> pd.DataFrame:
     rows = []
     for (eng, strat), d in g.groupby(["engine", "strategy"]):
         n = len(d)
+        whole = luck(d)
+        recent = luck(d[d["target"].isin(sorted(d["target"].unique())[-LUCK_RECENT:])])
         rows.append({"game": "로또", "group": f"{eng} {strat}", "draws": d["target"].nunique(), "tickets": n,
                      "avg_hits": round(d["hits"].mean(), 3), "theory_avg": 0.8,
                      "prize_count": int((d["hits"] >= 3).sum()),
                      "theory_prize": round(n * sum(P_MATCH[k] for k in (3, 4, 5, 6)), 2),
-                     "detail": " ".join(f"{k}개:{int((d['hits'] == k).sum())}" for k in range(7) if (d["hits"] == k).any())})
+                     "detail": " ".join(f"{k}개:{int((d['hits'] == k).sum())}" for k in range(7) if (d["hits"] == k).any()),
+                     "luck_pct": round(whole["pct"], 1), "luck": whole["label"],
+                     "recent_draws": min(LUCK_RECENT, d["target"].nunique()), "recent_hits": recent["hits"],
+                     "recent_expect": round(recent["expect"], 1), "recent_pct": round(recent["pct"], 1),
+                     "recent_luck": recent["label"]})
     for eng, d in pg.groupby("engine"):
         n = len(d)
         rows.append({"game": "연금", "group": f"{eng} 후보 전체", "draws": d["target"].nunique(), "tickets": n,
                      "avg_hits": round(d["tail"].mean(), 3), "theory_avg": round(sum(0.1 ** k for k in range(1, 7)), 3),
                      "prize_count": int((d["tail"] >= 1).sum()), "theory_prize": round(n * 0.1, 2),
                      "detail": " ".join(f"끝{k}자리:{int((d['tail'] == k).sum())}" for k in range(1, 7) if (d["tail"] == k).any())})
-    return pd.DataFrame(rows)
+    # 연금은 10순위마다 끝자리 0~9가 다 들어가 7등 수가 구조적으로 고정 → 운 판정 대상 아님(빈칸)
+    sb = pd.DataFrame(rows)
+    for c in ("recent_draws", "recent_hits"):
+        if c in sb:
+            sb[c] = sb[c].astype("Int64")
+    return sb
 
 
 # ──────────────────────────────── 참고 통계 ────────────────────────────────
@@ -569,6 +627,13 @@ def run_report(n_sets: int, n_pension: int, strength: float) -> None:
     for _, r in sb.iterrows():
         w(f"| {r['game']} {r['group']} | {r['draws']} | {r['tickets']} | {r['avg_hits']:.2f} | {r['theory_avg']:.2f} "
           f"| {r['prize_count']} | {r['theory_prize']:.1f} | {r['detail']} |")
+    w("")
+    w("**운 판정** — 무작위로 샀다면 100번 중 몇 번이 이보다 덜 맞았을지 (50 = 딱 평균, 25~75 = 정상 범위)\n")
+    w(f"| 구분 | 전체 | 판정 | 최근 {LUCK_RECENT}회 적중(기대) | 최근 판정 |")
+    w("|---|--:|---|--:|---|")
+    for _, r in sb[sb["game"] == "로또"].iterrows():
+        w(f"| {r['group']} | {r['luck_pct']:.0f} | {r['luck']} | {int(r['recent_hits'])}개({r['recent_expect']:.1f}) "
+          f"| {r['recent_pct']:.0f} · {r['recent_luck']} |")
     w("")
     w("대조군 = 같은 주에 완전 무작위로 뽑은 5세트(구매용 아님). 공식 추천과 적중률이 같게 나오는 것이 정상이다 —")
     w("어떤 방법도 적중 확률 자체는 바꾸지 못한다는 것을 매주 실전으로 확인하는 장치다.\n")

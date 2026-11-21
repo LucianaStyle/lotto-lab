@@ -172,7 +172,10 @@ check('v2 공식 추천만 가져옴 (대조군·v1 제외)', P.length - 1, pick
 check('v2 헤더', P[0], ctx.LV2.head);
 check('첫 세트 번호 = CSV와 동일', P[1].slice(4, 10), picks[0].slice(6, 12).map(Number));
 check('분할배율 숫자', typeof P[1][10], 'number');
-check('미추첨 표시', P[1][12], '추첨 전');
+// 미러 데이터는 매주 늘어나므로 '아직 추첨 안 된 회차'는 이력 마지막 회차 다음으로 고른다
+const lastDrawn = Number(lastCsv[0]);
+const pendingRow = P.find(r => r[1] > lastDrawn);
+check('미추첨 표시', pendingRow ? pendingRow[12] : '(미추첨 추천 없음)', '추첨 전');
 
 const pp = mirror['pension_picks.csv'].trim().split('\n').slice(1).map(l => l.split(',')).filter(r => r[3] === 'v2');
 const PP = S('연금추천');
@@ -199,6 +202,14 @@ const pop = S('번호인기도');
 check('번호인기도 7번 칸 값', typeof pop[2][8], 'number');
 const chk = S('검증');
 check('검증: 백테스트 3개 엔진 행', chk.filter(r => /^(v1|v2|무작위)/.test(String(r[0]))).length, 3);
+const score = S('성적');
+const luckHead = score.findIndex(r => /^로또 운 판정/.test(String(r[0])));
+check('성적: 운 판정 섹션 존재', luckHead > 0, true);
+const luckV2 = score.slice(luckHead).find(r => r[0] === 'v2 공식');
+check('운 판정 v2 공식 점수 0~100 숫자', typeof luckV2[1] === 'number' && luckV2[1] >= 0 && luckV2[1] <= 100, true);
+check('운 판정 문구', /정상 범위|운이/.test(luckV2[2]), true);
+check('운 판정 색칠', sheets['성적']._fmt.bg[`${luckHead + 3},3`] !== undefined, true);
+check('운 판정에 연금 행 없음', score.slice(luckHead).some(r => /후보 전체/.test(String(r[0]))), false);
 check('탭 순서 첫 번째 = 로또추천', tabOrder[0], [1, '로또추천']);
 
 console.log('\n── 2회차 동기화 (변경 없음 → 중복 없음) ──');
@@ -209,7 +220,8 @@ check('행 수 불변', [S('로또이력').length, S('로또추천').length, S('
 check('변경 없음 안내', /변경 없음/.test(toasts.slice(-1)[0]), true);
 
 console.log('\n── 새 회차 도착 시뮬레이션 ──');
-const target = Number(picks[0][1]);
+const target = lastDrawn + 1;
+const scoredBefore = S('성적').find(r => r[0] === 'v2 현행')[1];
 const ours = picks.filter(r => Number(r[1]) === target);
 const A = ours[0].slice(6, 12).map(Number);
 const drawn = [A[0], A[1], A[2], A[3], ...[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45]
@@ -226,7 +238,7 @@ check('다음 회차 추천 추가', P2.filter(r => r[1] === target + 1).length,
 check('다음 회차는 추첨 전', P2.find(r => r[1] === target + 1)[12], '추첨 전');
 const fmtA = sheets['로또추천']._fmt.bg;
 check('A세트 5번째 칸 보너스 호박색', fmtA[`${rowA + 1},9`], '#ffe08a');
-check('성적 v2 채점 세트 = 5', S('성적').find(r => r[0] === 'v2 현행')[1], 5);
+check('성적 v2 채점 세트 +5', S('성적').find(r => r[0] === 'v2 현행')[1], scoredBefore + 5);
 
 console.log('\n── 구 트리거 호환 ──');
 try { ctx.weeklyJob(); console.log('PASS  weeklyJob 별칭 동작'); } catch (e) { fail++; console.log('FAIL  weeklyJob', e.message); }

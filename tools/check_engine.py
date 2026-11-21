@@ -94,6 +94,17 @@ finally:
     L.LOTTO_PICKS_CSV, L.PENSION_PICKS_CSV = saved
     shutil.rmtree(tmp)
 
+# ── 운 판정: 적중 분포가 이론과 일치 ──
+pm = L.draw_hits_pmf([tuple(range(1 + 6 * i, 7 + 6 * i)) for i in range(5)])
+mean = float((np.arange(len(pm)) * pm).sum())
+check(f"운 판정 분포: 30개 서로 다른 번호 → 합 1·평균 4.0 (실제 {pm.sum():.4f}·{mean:.3f})",
+      abs(pm.sum() - 1) < 1e-9 and abs(mean - 4) < 1e-9)
+pm2 = L.draw_hits_pmf([(1, 2, 3, 4, 5, 6)] * 2)
+check("운 판정 분포: 같은 세트 2장 → 평균 1.6·홀수 적중 불가",
+      abs(float((np.arange(len(pm2)) * pm2).sum()) - 1.6) < 1e-9 and pm2[1::2].sum() < 1e-12)
+check("운 판정 구간 문구", [L.luck_label(x) for x in (2, 20, 50, 80, 99)] ==
+      ["운이 많이 나쁨", "운이 조금 나쁜 편", "정상 범위", "운이 조금 좋은 편", "운이 아주 좋음"])
+
 # ── 데이터: 판매액 필드 ──
 recent = lotto.tail(100)
 ratio5 = (recent["r5_n"] / (L.lotto_games(recent) * L.P_RANK5)).median()
